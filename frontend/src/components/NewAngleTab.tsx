@@ -2,15 +2,37 @@ import { useState } from 'react';
 import { Wand2 } from 'lucide-react';
 import DropZone from './DropZone';
 import PromptInput from './PromptInput';
+import ModelSelector from './ModelSelector';
 import ResultPanel from './ResultPanel';
 import { submitNewAngle } from '../api';
 
 const ANGLE_PRESETS = [
-  { label: 'Worm\'s Eye View', value: "extreme low angle looking up, worm's eye view, dramatic perspective" },
-  { label: 'Bird\'s Eye', value: "aerial bird's eye view from above, looking down at the building" },
-  { label: 'Street Level', value: "street level view, pedestrian perspective, eye-level shot" },
-  { label: 'Corner View', value: "dynamic corner view, 45-degree angle, showing two facades" },
-  { label: 'Distant Skyline', value: "distant view from far away, full building in skyline context" },
+  { label: "Worm's Eye View", value: "extreme low angle looking up, worm's eye view, dramatic perspective" },
+  { label: "Bird's Eye", value: "aerial bird's eye view from above, looking down at the building" },
+  { label: 'Street Level', value: 'street level view, pedestrian perspective, eye-level shot' },
+  { label: 'Corner View', value: 'dynamic corner view, 45-degree angle, showing two facades' },
+  { label: 'Distant Skyline', value: 'distant view from far away, full building in skyline context' },
+];
+
+const MODELS = [
+  {
+    id: 'zero123plus',
+    name: 'Zero123++',
+    tag: 'recommended' as const,
+    note: 'True novel-view synthesis. Geometrically accurate new angles from a single image.',
+  },
+  {
+    id: 'flux-redux',
+    name: 'Flux Redux (prompt-guided)',
+    tag: 'fast' as const,
+    note: 'Preserves building identity while steering the viewpoint via text prompt.',
+  },
+  {
+    id: 'flux-img2img',
+    name: 'Flux Dev img2img',
+    tag: 'fallback' as const,
+    note: 'Standard img2img. Less geometrically precise, more stylised output.',
+  },
 ];
 
 export default function NewAngleTab() {
@@ -18,6 +40,7 @@ export default function NewAngleTab() {
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [anglePrompt, setAnglePrompt] = useState('');
   const [stylePrompt, setStylePrompt] = useState('');
+  const [model, setModel] = useState(MODELS[0].id);
   const [jobId, setJobId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -27,7 +50,7 @@ export default function NewAngleTab() {
     if (!renderFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitNewAngle(renderFile, referenceFile, anglePrompt, stylePrompt);
+      const { jobId } = await submitNewAngle(renderFile, referenceFile, anglePrompt, stylePrompt, model);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);
@@ -93,6 +116,8 @@ export default function NewAngleTab() {
         onChange={setStylePrompt}
         placeholder="e.g. photorealistic, golden hour, glass and gold facade, lush greenery"
       />
+
+      <ModelSelector models={MODELS} value={model} onChange={setModel} />
 
       <button
         onClick={handleSubmit}

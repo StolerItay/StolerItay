@@ -2,13 +2,36 @@ import { useState } from 'react';
 import { Wand2 } from 'lucide-react';
 import DropZone from './DropZone';
 import PromptInput from './PromptInput';
+import ModelSelector from './ModelSelector';
 import ResultPanel from './ResultPanel';
 import { submitUpdateRender } from '../api';
+
+const MODELS = [
+  {
+    id: 'flux-controlnet-canny',
+    name: 'Flux Dev ControlNet — Canny',
+    tag: 'recommended' as const,
+    note: 'Best quality. Uses edge detection on the mass to guide generation.',
+  },
+  {
+    id: 'flux-controlnet-depth',
+    name: 'Flux Dev ControlNet — Depth',
+    tag: 'fast' as const,
+    note: 'Better for masses with clear depth variation or 3D screenshots.',
+  },
+  {
+    id: 'sdxl-controlnet',
+    name: 'SDXL ControlNet — Canny',
+    tag: 'fallback' as const,
+    note: 'Older model, faster & cheaper. Good for quick tests.',
+  },
+];
 
 export default function UpdateRenderTab() {
   const [renderFile, setRenderFile] = useState<File | null>(null);
   const [massFile, setMassFile] = useState<File | null>(null);
   const [prompt, setPrompt] = useState('');
+  const [model, setModel] = useState(MODELS[0].id);
   const [jobId, setJobId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -18,7 +41,7 @@ export default function UpdateRenderTab() {
     if (!renderFile || !massFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitUpdateRender(renderFile, massFile, prompt);
+      const { jobId } = await submitUpdateRender(renderFile, massFile, prompt, model);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);
@@ -55,6 +78,8 @@ export default function UpdateRenderTab() {
         onChange={setPrompt}
         placeholder="e.g. glass curtain wall with gold accents, photorealistic dusk render, lush greenery, dramatic lighting"
       />
+
+      <ModelSelector models={MODELS} value={model} onChange={setModel} />
 
       <button
         onClick={handleSubmit}

@@ -1,6 +1,28 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
 import { Eraser, Paintbrush, Wand2, RotateCcw } from 'lucide-react';
 import { submitInpaint, pollJob } from '../api';
+import ModelSelector from './ModelSelector';
+
+const INPAINT_MODELS = [
+  {
+    id: 'flux-fill-pro',
+    name: 'Flux Fill Pro',
+    tag: 'recommended' as const,
+    note: 'State of the art. Seamless blending, photorealistic results.',
+  },
+  {
+    id: 'flux-fill-dev',
+    name: 'Flux Fill Dev',
+    tag: 'fast' as const,
+    note: 'Faster and cheaper than Pro. Slightly less refined blending.',
+  },
+  {
+    id: 'sd-inpainting',
+    name: 'SD Inpainting',
+    tag: 'fallback' as const,
+    note: 'Classic Stable Diffusion inpainting. Quick & low cost.',
+  },
+];
 
 interface Props {
   imageUrl: string;
@@ -16,6 +38,7 @@ export default function InpaintCanvas({ imageUrl, onDone, onNewResult }: Props) 
   const [isErasing, setIsErasing] = useState(false);
   const [brushSize, setBrushSize] = useState(30);
   const [prompt, setPrompt] = useState('');
+  const [inpaintModel, setInpaintModel] = useState(INPAINT_MODELS[0].id);
   const [generating, setGenerating] = useState(false);
   const [dims, setDims] = useState({ w: 800, h: 500 });
   const lastPos = useRef<{ x: number; y: number } | null>(null);
@@ -150,7 +173,7 @@ export default function InpaintCanvas({ imageUrl, onDone, onNewResult }: Props) 
     setGenerating(true);
     try {
       const maskDataUrl = getMaskDataUrl();
-      const { jobId } = await submitInpaint(imageUrl, maskDataUrl, prompt);
+      const { jobId } = await submitInpaint(imageUrl, maskDataUrl, prompt, inpaintModel);
       // Poll
       let done = false;
       while (!done) {
@@ -242,6 +265,7 @@ export default function InpaintCanvas({ imageUrl, onDone, onNewResult }: Props) 
         className="w-full rounded-xl bg-gray-900 border border-gray-700 text-gray-200 placeholder-gray-600
           px-4 py-3 text-sm resize-none focus:outline-none focus:border-yellow-500/60 transition-colors"
       />
+      <ModelSelector models={INPAINT_MODELS} value={inpaintModel} onChange={setInpaintModel} />
       <div className="flex gap-3">
         <button
           onClick={handleGenerate}

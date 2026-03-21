@@ -5,12 +5,14 @@ const BASE = '/api';
 export async function submitUpdateRender(
   renderFile: File,
   massFile: File,
-  prompt: string
+  prompt: string,
+  model: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('render', renderFile);
   form.append('mass', massFile);
   form.append('prompt', prompt);
+  form.append('model', model);
   const { data } = await axios.post(`${BASE}/update-render`, form);
   return data;
 }
@@ -18,12 +20,14 @@ export async function submitUpdateRender(
 export async function submitStyleTransfer(
   referenceFile: File,
   massFile: File,
-  prompt: string
+  prompt: string,
+  model: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('reference', referenceFile);
   form.append('mass', massFile);
   form.append('prompt', prompt);
+  form.append('model', model);
   const { data } = await axios.post(`${BASE}/style-transfer`, form);
   return data;
 }
@@ -32,13 +36,15 @@ export async function submitNewAngle(
   renderFile: File,
   referenceFile: File | null,
   anglePrompt: string,
-  stylePrompt: string
+  stylePrompt: string,
+  model: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('render', renderFile);
   if (referenceFile) form.append('reference', referenceFile);
   form.append('angle_prompt', anglePrompt);
   form.append('style_prompt', stylePrompt);
+  form.append('model', model);
   const { data } = await axios.post(`${BASE}/new-angle`, form);
   return data;
 }
@@ -46,7 +52,8 @@ export async function submitNewAngle(
 export async function submitInpaint(
   baseImage: File | string,
   maskDataUrl: string,
-  prompt: string
+  prompt: string,
+  model: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   if (typeof baseImage === 'string') {
@@ -56,6 +63,7 @@ export async function submitInpaint(
   }
   form.append('mask_data_url', maskDataUrl);
   form.append('prompt', prompt);
+  form.append('model', model);
   const { data } = await axios.post(`${BASE}/inpaint`, form);
   return data;
 }

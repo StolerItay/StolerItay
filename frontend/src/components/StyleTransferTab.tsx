@@ -2,13 +2,36 @@ import { useState } from 'react';
 import { Wand2 } from 'lucide-react';
 import DropZone from './DropZone';
 import PromptInput from './PromptInput';
+import ModelSelector from './ModelSelector';
 import ResultPanel from './ResultPanel';
 import { submitStyleTransfer } from '../api';
+
+const MODELS = [
+  {
+    id: 'flux-redux-controlnet',
+    name: 'Flux Redux → Flux ControlNet',
+    tag: 'recommended' as const,
+    note: 'Two-step: Redux extracts style from reference, ControlNet constrains to mass shape.',
+  },
+  {
+    id: 'flux-redux-only',
+    name: 'Flux Redux Only',
+    tag: 'fast' as const,
+    note: 'Single step. Looser mass adherence but faster and often more creative.',
+  },
+  {
+    id: 'sdxl-img2img',
+    name: 'SDXL img2img',
+    tag: 'fallback' as const,
+    note: 'Classic img2img. Cheapest option, lower fidelity.',
+  },
+];
 
 export default function StyleTransferTab() {
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [massFile, setMassFile] = useState<File | null>(null);
   const [prompt, setPrompt] = useState('');
+  const [model, setModel] = useState(MODELS[0].id);
   const [jobId, setJobId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -18,7 +41,7 @@ export default function StyleTransferTab() {
     if (!referenceFile || !massFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitStyleTransfer(referenceFile, massFile, prompt);
+      const { jobId } = await submitStyleTransfer(referenceFile, massFile, prompt, model);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);
@@ -55,6 +78,8 @@ export default function StyleTransferTab() {
         onChange={setPrompt}
         placeholder="e.g. biophilic design, warm wood lattice, floor-to-ceiling glass, golden hour lighting"
       />
+
+      <ModelSelector models={MODELS} value={model} onChange={setModel} />
 
       <button
         onClick={handleSubmit}
