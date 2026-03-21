@@ -54,26 +54,26 @@ async def run_controlnet_render(
     prompt: str,
     job_id: str,
 ) -> None:
-    """Use ControlNet (edge/canny) to replace building with new mass."""
+    """Flux Dev ControlNet (canny) — replace building with new mass at high quality."""
     try:
         jobs[job_id]["status"] = "processing"
 
         full_prompt = (
             f"Photorealistic architectural render, {prompt}, "
             "8K resolution, professional architectural photography, "
-            "detailed materials, realistic lighting"
+            "detailed materials, realistic lighting, ultra sharp"
         )
 
         output = await asyncio.to_thread(
             replicate.run,
-            "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613",
+            "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
             input={
-                "image": open(mass_path, "rb"),
+                "control_image": open(mass_path, "rb"),
                 "prompt": full_prompt,
-                "negative_prompt": "cartoon, sketch, low quality, blurry, distorted",
-                "num_inference_steps": 30,
-                "guidance_scale": 9.0,
-                "controlnet_conditioning_scale": 1.0,
+                "controlnet_conditioning_scale": 0.75,
+                "num_inference_steps": 28,
+                "guidance_scale": 3.5,
+                "control_type": "canny",
             },
         )
 
@@ -89,26 +89,40 @@ async def run_style_transfer(
     prompt: str,
     job_id: str,
 ) -> None:
-    """Style transfer: apply reference image style to new mass using img2img + ControlNet."""
+    """Flux Redux (style transfer) + Flux ControlNet: apply reference style to new mass."""
     try:
         jobs[job_id]["status"] = "processing"
 
-        full_prompt = (
-            f"Photorealistic architectural render, {prompt}, "
-            "matching the style and atmosphere of the reference, "
-            "professional CGI render, high detail"
+        # Step 1: extract style embedding from reference via Flux Redux
+        redux_output = await asyncio.to_thread(
+            replicate.run,
+            "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
+            input={
+                "redux_image": open(reference_path, "rb"),
+                "prompt": (
+                    f"Photorealistic architectural render of this building mass, "
+                    f"{prompt}, matching the style and materials of the reference"
+                ),
+                "num_inference_steps": 28,
+                "guidance_scale": 3.5,
+            },
         )
+        style_url = redux_output[0] if isinstance(redux_output, list) else redux_output
 
+        # Step 2: apply that styled result through ControlNet guided by the mass
         output = await asyncio.to_thread(
             replicate.run,
-            "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613",
+            "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
             input={
-                "image": open(mass_path, "rb"),
-                "prompt": full_prompt,
-                "negative_prompt": "cartoon, low quality, blurry",
-                "num_inference_steps": 30,
-                "guidance_scale": 9.0,
-                "image_resolution": 768,
+                "control_image": open(mass_path, "rb"),
+                "prompt": (
+                    f"Photorealistic architectural render, {prompt}, "
+                    "matching the style of the reference image, high detail, 8K"
+                ),
+                "controlnet_conditioning_scale": 0.7,
+                "num_inference_steps": 28,
+                "guidance_scale": 3.5,
+                "control_type": "canny",
             },
         )
 
@@ -125,28 +139,37 @@ async def run_new_angle(
     style_prompt: str,
     job_id: str,
 ) -> None:
-    """Generate a new camera angle using img2img."""
+    """Zero123++ for novel view synthesis; falls back to Flux img2img if angle_prompt only."""
     try:
         jobs[job_id]["status"] = "processing"
 
-        combined_prompt = (
-            f"Architectural render of the same building from {angle_prompt}, "
-            f"{style_prompt}, "
-            "photorealistic, professional CGI, 8K, detailed facade"
-        )
-
-        output = await asyncio.to_thread(
-            replicate.run,
-            "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4af4b36f754e9f0c0ab6ef05c89bff8953",
-            input={
-                "image": open(render_path, "rb"),
-                "prompt": combined_prompt,
-                "negative_prompt": "cartoon, low quality, blurry, distorted perspective",
-                "prompt_strength": 0.65,
-                "num_inference_steps": 30,
-                "guidance_scale": 9.0,
-            },
-        )
+        if not angle_prompt and reference_path:
+            # Pure novel-view: use Zero123++ to synthesise new camera angles
+            output = await asyncio.to_thread(
+                replicate.run,
+                "sudo-ai/zero123plus:0e3a8a2cc1f5b88a0c24a40a5fd10d84be4b76c0e83a55a7b1f7c7ac67df5432",
+                input={
+                    "image": open(render_path, "rb"),
+                    "scale": 4.0,
+                    "num_inference_steps": 36,
+                },
+            )
+        else:
+            # Prompt-guided angle: Flux Redux keeps identity, prompt steers viewpoint
+            combined_prompt = (
+                f"Architectural render of the exact same building, {angle_prompt}, "
+                f"{style_prompt}, photorealistic, professional CGI, 8K, detailed facade"
+            )
+            output = await asyncio.to_thread(
+                replicate.run,
+                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
+                input={
+                    "redux_image": open(render_path, "rb"),
+                    "prompt": combined_prompt,
+                    "num_inference_steps": 28,
+                    "guidance_scale": 3.5,
+                },
+            )
 
         output_url = output[0] if isinstance(output, list) else output
         jobs[job_id].update({"status": "done", "output_url": str(output_url)})
@@ -185,14 +208,14 @@ async def run_inpaint(
 
         output = await asyncio.to_thread(
             replicate.run,
-            "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
+            "black-forest-labs/flux-fill-pro",
             input={
                 "image": image_input,
                 "mask": open(mask_path, "rb"),
                 "prompt": full_prompt,
-                "negative_prompt": "low quality, blurry, distorted",
-                "num_inference_steps": 30,
-                "guidance_scale": 8.5,
+                "num_inference_steps": 28,
+                "guidance": 30,
+                "output_format": "png",
             },
         )
 
