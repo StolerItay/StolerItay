@@ -152,6 +152,69 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
     raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
+async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt: str = "") -> str:
+    """Use Gemini 2.5 Pro to deeply analyze mass + reference and produce a detailed render prompt."""
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    mass_b64, mass_mime = _b64(mass_path)
+    ref_b64, ref_mime = _b64(reference_path)
+
+    instruction = (
+        "You are a senior architectural visualization director. "
+        "Analyze both images carefully:\n"
+        "- Image 1: an architectural mass/volume model (simplified 3D building geometry).\n"
+        "- Image 2: a reference architectural render showing the target style.\n\n"
+        "Write a detailed image generation prompt (300-500 words) that will guide an AI image model "
+        "to render Image 1's geometry in the exact style of Image 2. Cover:\n"
+        "1. Building geometry and form (from Image 1)\n"
+        "2. Facade materials, textures, colors, glass type (from Image 2)\n"
+        "3. Structural and architectural details (from Image 2)\n"
+        "4. Lighting conditions, time of day, shadows (from Image 2)\n"
+        "5. Sky, weather, atmosphere (from Image 2)\n"
+        "6. Surrounding context, ground, vegetation (from Image 2)\n"
+        "7. Camera angle and framing\n"
+        "Output only the prompt text, no preamble."
+    )
+    if extra_prompt.strip():
+        instruction += f"\n\nAdditional direction from the user: {extra_prompt.strip()}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+                {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+            ]
+        }],
+    }
+
+    # Try 2.5 Pro first, then 2.5 Flash as fallback
+    for _mid in ["gemini-2.5-pro", "gemini-2.5-flash"]:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=60) as http:
+            r = await http.post(_url, json=payload)
+            if r.status_code in (400, 404):
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    raise ValueError("Neither gemini-2.5-pro nor gemini-2.5-flash responded successfully.")
+
+
+async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = "") -> Path:
+    """Two-step: Gemini 2.5 Pro analyzes → writes detailed prompt → image-gen model renders."""
+    rich_prompt = await gemini_25_analyze(mass_path, reference_path, prompt)
+    return await gemini_generate_render(mass_path, reference_path, rich_prompt)
+
+
 async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str:
     """Use Gemini Vision (REST API) to extract a precise architectural style prompt from an image."""
     key = get_gemini_key()
@@ -330,7 +393,13 @@ async def run_style_transfer(
 
         token = get_api_token(api_token)
 
-        if model == "gemini-direct":
+        if model == "gemini-25-pro":
+            # Step 1: Gemini 2.5 Pro/Flash analyzes both images → rich architectural prompt.
+            # Step 2: That prompt + mass → image-gen model renders the result.
+            out_path = await gemini_25_render(mass_path, reference_path, prompt)
+            output_url = f"/outputs/{out_path.name}"
+
+        elif model == "gemini-direct":
             # Gemini generates the render directly from mass + reference images.
             # No Replicate token needed for this path.
             out_path = await gemini_generate_render(mass_path, reference_path, prompt)

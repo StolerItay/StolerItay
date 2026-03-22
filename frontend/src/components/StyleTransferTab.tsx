@@ -8,10 +8,16 @@ import { submitStyleTransfer } from '../api';
 
 const MODELS = [
   {
+    id: 'gemini-25-pro',
+    name: 'Gemini 2.5 Pro → Image Gen',
+    tag: 'recommended' as const,
+    note: 'Two-step: Gemini 2.5 Pro deeply analyzes both images and writes a rich architectural prompt, then the image-gen model renders it. Best quality.',
+  },
+  {
     id: 'gemini-direct',
     name: 'Gemini 2.0 Flash (Direct)',
-    tag: 'recommended' as const,
-    note: 'Gemini sees both the mass and reference image and generates the render directly. No Replicate token needed — only GEMINI_API_KEY.',
+    tag: 'fast' as const,
+    note: 'Gemini sees both the mass and reference image and generates the render in one step. No Replicate token needed — only GEMINI_API_KEY.',
   },
   {
     id: 'flux-redux-controlnet',
