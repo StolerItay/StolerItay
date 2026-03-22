@@ -45,7 +45,7 @@ const MODELS = [
   },
 ];
 
-export default function StyleTransferTab({ apiKey }: { apiKey?: string }) {
+export default function StyleTransferTab() {
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [massFile, setMassFile] = useState<File | null>(null);
   const [prompt, setPrompt] = useState('');
@@ -59,7 +59,7 @@ export default function StyleTransferTab({ apiKey }: { apiKey?: string }) {
     if (!referenceFile || !massFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitStyleTransfer(referenceFile, massFile, prompt, model, apiKey);
+      const { jobId } = await submitStyleTransfer(referenceFile, massFile, prompt, model);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);

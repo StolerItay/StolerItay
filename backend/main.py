@@ -242,7 +242,7 @@ async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str
         }]
     }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={key}"
     async with httpx.AsyncClient(timeout=30) as http:
         r = await http.post(url, json=payload)
         r.raise_for_status()
