@@ -70,12 +70,18 @@ CONTROLNET_MODELS = {
 }
 
 
+def get_replicate_client(api_token: Optional[str] = None) -> replicate.Client:
+    token = api_token or os.getenv("REPLICATE_API_TOKEN", "")
+    return replicate.Client(api_token=token)
+
+
 async def run_controlnet_render(
     render_path: Path,
     mass_path: Path,
     prompt: str,
     model: str,
     job_id: str,
+    api_token: Optional[str] = None,
 ) -> None:
     """ControlNet-guided render: replace building with new mass."""
     try:
@@ -87,9 +93,10 @@ async def run_controlnet_render(
             "detailed materials, realistic lighting, ultra sharp"
         )
 
+        client = get_replicate_client(api_token)
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
         output = await asyncio.to_thread(
-            replicate.run,
+            client.run,
             cfg["id"],
             input={cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]},
         )
@@ -106,6 +113,7 @@ async def run_style_transfer(
     prompt: str,
     model: str,
     job_id: str,
+    api_token: Optional[str] = None,
 ) -> None:
     """Style transfer: apply reference image style onto new mass."""
     try:
@@ -116,16 +124,17 @@ async def run_style_transfer(
             "matching the style and materials of the reference, high detail, 8K"
         )
 
+        client = get_replicate_client(api_token)
         if model == "flux-redux-controlnet":
             # Two-step: Redux extracts style, ControlNet constrains to mass
             await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
                        "num_inference_steps": 28, "guidance_scale": 3.5},
             )
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
                 input={"control_image": open(mass_path, "rb"), "prompt": style_prompt,
                        "controlnet_conditioning_scale": 0.7, "num_inference_steps": 28,
@@ -133,14 +142,14 @@ async def run_style_transfer(
             )
         elif model == "flux-redux-only":
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
                        "num_inference_steps": 28, "guidance_scale": 3.5},
             )
         else:  # sdxl-img2img
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
                 input={"image": open(mass_path, "rb"), "prompt": style_prompt,
                        "prompt_strength": 0.7, "num_inference_steps": 30, "guidance_scale": 9.0},
@@ -159,6 +168,7 @@ async def run_new_angle(
     style_prompt: str,
     model: str,
     job_id: str,
+    api_token: Optional[str] = None,
 ) -> None:
     """Generate a new camera angle of a building."""
     try:
@@ -169,22 +179,23 @@ async def run_new_angle(
             f"{style_prompt}, photorealistic, professional CGI, 8K, detailed facade"
         )
 
+        client = get_replicate_client(api_token)
         if model == "zero123plus":
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "sudo-ai/zero123plus:0e3a8a2cc1f5b88a0c24a40a5fd10d84be4b76c0e83a55a7b1f7c7ac67df5432",
                 input={"image": open(render_path, "rb"), "scale": 4.0, "num_inference_steps": 36},
             )
         elif model == "flux-redux":
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(render_path, "rb"), "prompt": combined_prompt,
                        "num_inference_steps": 28, "guidance_scale": 3.5},
             )
         else:  # flux-img2img
             output = await asyncio.to_thread(
-                replicate.run,
+                client.run,
                 "black-forest-labs/flux-dev:a60b88a054a2c9e7f6d5e5c8a42b2d6e7c8f9a1b2c3d4e5f6a7b8c9d0e1f2a3b",
                 input={"image": open(render_path, "rb"), "prompt": combined_prompt,
                        "prompt_strength": 0.65, "num_inference_steps": 28, "guidance_scale": 3.5},
@@ -203,6 +214,7 @@ async def run_inpaint(
     prompt: str,
     inpaint_model: str,
     job_id: str,
+    api_token: Optional[str] = None,
 ) -> None:
     """Inpaint a masked region of an image."""
     try:
@@ -243,8 +255,9 @@ async def run_inpaint(
                      "negative_prompt": "low quality, blurry, distorted"}),
         }
 
+        client = get_replicate_client(api_token)
         output = await asyncio.to_thread(
-            replicate.run,
+            client.run,
             inpaint_model_id,
             input=model_input,
         )
@@ -264,12 +277,13 @@ async def update_render(
     mass: UploadFile = File(...),
     prompt: str = Form(""),
     model: str = Form("flux-controlnet-canny"),
+    replicate_api_token: Optional[str] = Form(None),
 ):
     render_path = save_upload(render)
     mass_path = save_upload(mass)
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
-    asyncio.create_task(run_controlnet_render(render_path, mass_path, prompt, model, job_id))
+    asyncio.create_task(run_controlnet_render(render_path, mass_path, prompt, model, job_id, replicate_api_token))
     return {"jobId": job_id}
 
 
@@ -279,12 +293,13 @@ async def style_transfer(
     mass: UploadFile = File(...),
     prompt: str = Form(""),
     model: str = Form("flux-redux-controlnet"),
+    replicate_api_token: Optional[str] = Form(None),
 ):
     reference_path = save_upload(reference)
     mass_path = save_upload(mass)
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
-    asyncio.create_task(run_style_transfer(reference_path, mass_path, prompt, model, job_id))
+    asyncio.create_task(run_style_transfer(reference_path, mass_path, prompt, model, job_id, replicate_api_token))
     return {"jobId": job_id}
 
 
@@ -295,12 +310,13 @@ async def new_angle(
     angle_prompt: str = Form(""),
     style_prompt: str = Form(""),
     model: str = Form("zero123plus"),
+    replicate_api_token: Optional[str] = Form(None),
 ):
     render_path = save_upload(render)
     reference_path = save_upload(reference) if reference else None
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
-    asyncio.create_task(run_new_angle(render_path, reference_path, angle_prompt, style_prompt, model, job_id))
+    asyncio.create_task(run_new_angle(render_path, reference_path, angle_prompt, style_prompt, model, job_id, replicate_api_token))
     return {"jobId": job_id}
 
 
@@ -311,6 +327,7 @@ async def inpaint(
     mask_data_url: str = Form(...),
     prompt: str = Form(...),
     model: str = Form("flux-fill-pro"),
+    replicate_api_token: Optional[str] = Form(None),
 ):
     base_path: Optional[Path] = None
     if base_image and base_image.filename:
@@ -318,7 +335,7 @@ async def inpaint(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
-    asyncio.create_task(run_inpaint(base_image_url, base_path, mask_data_url, prompt, model, job_id))
+    asyncio.create_task(run_inpaint(base_image_url, base_path, mask_data_url, prompt, model, job_id, replicate_api_token))
     return {"jobId": job_id}
 
 

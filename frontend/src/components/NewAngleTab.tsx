@@ -35,7 +35,7 @@ const MODELS = [
   },
 ];
 
-export default function NewAngleTab() {
+export default function NewAngleTab({ apiKey }: { apiKey?: string }) {
   const [renderFile, setRenderFile] = useState<File | null>(null);
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [anglePrompt, setAnglePrompt] = useState('');
@@ -50,7 +50,7 @@ export default function NewAngleTab() {
     if (!renderFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitNewAngle(renderFile, referenceFile, anglePrompt, stylePrompt, model);
+      const { jobId } = await submitNewAngle(renderFile, referenceFile, anglePrompt, stylePrompt, model, apiKey);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);

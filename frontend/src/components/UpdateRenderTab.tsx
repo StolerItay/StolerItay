@@ -27,7 +27,7 @@ const MODELS = [
   },
 ];
 
-export default function UpdateRenderTab() {
+export default function UpdateRenderTab({ apiKey }: { apiKey?: string }) {
   const [renderFile, setRenderFile] = useState<File | null>(null);
   const [massFile, setMassFile] = useState<File | null>(null);
   const [prompt, setPrompt] = useState('');
@@ -41,7 +41,7 @@ export default function UpdateRenderTab() {
     if (!renderFile || !massFile) return;
     setLoading(true);
     try {
-      const { jobId } = await submitUpdateRender(renderFile, massFile, prompt, model);
+      const { jobId } = await submitUpdateRender(renderFile, massFile, prompt, model, apiKey);
       setJobId(jobId);
     } catch (err) {
       alert('Submission failed: ' + err);

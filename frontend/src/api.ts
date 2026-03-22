@@ -6,13 +6,15 @@ export async function submitUpdateRender(
   renderFile: File,
   massFile: File,
   prompt: string,
-  model: string
+  model: string,
+  apiKey?: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('render', renderFile);
   form.append('mass', massFile);
   form.append('prompt', prompt);
   form.append('model', model);
+  if (apiKey) form.append('replicate_api_token', apiKey);
   const { data } = await axios.post(`${BASE}/update-render`, form);
   return data;
 }
@@ -21,13 +23,15 @@ export async function submitStyleTransfer(
   referenceFile: File,
   massFile: File,
   prompt: string,
-  model: string
+  model: string,
+  apiKey?: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('reference', referenceFile);
   form.append('mass', massFile);
   form.append('prompt', prompt);
   form.append('model', model);
+  if (apiKey) form.append('replicate_api_token', apiKey);
   const { data } = await axios.post(`${BASE}/style-transfer`, form);
   return data;
 }
@@ -37,7 +41,8 @@ export async function submitNewAngle(
   referenceFile: File | null,
   anglePrompt: string,
   stylePrompt: string,
-  model: string
+  model: string,
+  apiKey?: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('render', renderFile);
@@ -45,6 +50,7 @@ export async function submitNewAngle(
   form.append('angle_prompt', anglePrompt);
   form.append('style_prompt', stylePrompt);
   form.append('model', model);
+  if (apiKey) form.append('replicate_api_token', apiKey);
   const { data } = await axios.post(`${BASE}/new-angle`, form);
   return data;
 }
@@ -53,7 +59,8 @@ export async function submitInpaint(
   baseImage: File | string,
   maskDataUrl: string,
   prompt: string,
-  model: string
+  model: string,
+  apiKey?: string
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   if (typeof baseImage === 'string') {
@@ -64,6 +71,7 @@ export async function submitInpaint(
   form.append('mask_data_url', maskDataUrl);
   form.append('prompt', prompt);
   form.append('model', model);
+  if (apiKey) form.append('replicate_api_token', apiKey);
   const { data } = await axios.post(`${BASE}/inpaint`, form);
   return data;
 }
