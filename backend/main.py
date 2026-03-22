@@ -74,20 +74,21 @@ CONTROLNET_MODELS = {
     "flux-controlnet-canny": {
         "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
-        "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.9,
-                   "num_inference_steps": 28, "guidance_scale": 3.5},
+        "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.7,
+                   "num_inference_steps": 50, "guidance_scale": 4.5},
     },
     "flux-controlnet-depth": {
         "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
-        "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.9,
-                   "num_inference_steps": 28, "guidance_scale": 3.5},
+        "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.7,
+                   "num_inference_steps": 50, "guidance_scale": 4.5},
     },
     "sdxl-controlnet": {
         "id": "diffusers/controlnet-canny-sdxl-1.0:a398a399f1238d5651c7bb7b5417823f1d559fc2ab1b7fa3f06a45d57c971db4",
         "input_key": "image",
-        "extra": {"num_inference_steps": 30, "guidance_scale": 9.0,
-                   "controlnet_conditioning_scale": 1.0},
+        "extra": {"num_inference_steps": 50, "guidance_scale": 9.0,
+                   "controlnet_conditioning_scale": 0.85,
+                   "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark, text"},
     },
 }
 
@@ -110,9 +111,12 @@ async def run_controlnet_render(
         jobs[job_id]["status"] = "processing"
 
         full_prompt = (
-            f"Photorealistic architectural render, {prompt}, "
-            "8K resolution, professional architectural photography, "
-            "detailed materials, realistic lighting, ultra sharp"
+            f"award-winning architectural visualization, {prompt}, "
+            "photorealistic CGI render, dramatic cinematic lighting, golden hour atmosphere, "
+            "volumetric light rays, ultra-detailed facade materials, glass curtain wall reflections, "
+            "ambient occlusion, ray-traced global illumination, professional architectural photography, "
+            "hyperrealistic, 8K ultra resolution, sharp focus, "
+            "Zaha Hadid Architects quality render, architectural digest cover shot"
         )
 
         client = get_replicate_client(api_token)
@@ -125,7 +129,7 @@ async def run_controlnet_render(
         # flux-dev-controlnet supports `image` + `prompt_strength` for img2img conditioning.
         if model in ("flux-controlnet-canny", "flux-controlnet-depth"):
             model_input["image"] = open(render_path, "rb")
-            model_input["prompt_strength"] = 0.65  # keep 35% of base render
+            model_input["prompt_strength"] = 0.80  # more creative freedom for higher quality
 
         output = await asyncio.to_thread(
             client.run,
@@ -152,8 +156,10 @@ async def run_style_transfer(
         jobs[job_id]["status"] = "processing"
 
         style_prompt = (
-            f"Photorealistic architectural render, {prompt}, "
-            "matching the style and materials of the reference, high detail, 8K"
+            f"award-winning architectural visualization, {prompt}, "
+            "faithfully matching the style, materials and atmosphere of the reference image, "
+            "photorealistic CGI render, cinematic lighting, ultra-detailed facade, "
+            "professional architectural photography, hyperrealistic, 8K ultra resolution"
         )
 
         client = get_replicate_client(api_token)
@@ -163,7 +169,7 @@ async def run_style_transfer(
                 client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
-                       "num_inference_steps": 28, "guidance_scale": 3.5},
+                       "num_inference_steps": 50, "guidance_scale": 4.5},
             )
             redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
 
@@ -172,23 +178,24 @@ async def run_style_transfer(
                 client.run,
                 "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
                 input={"control_image": open(mass_path, "rb"), "image": redux_url,
-                       "prompt": style_prompt, "prompt_strength": 0.7,
-                       "controlnet_conditioning_scale": 0.9, "num_inference_steps": 28,
-                       "guidance_scale": 3.5, "control_type": "canny"},
+                       "prompt": style_prompt, "prompt_strength": 0.80,
+                       "controlnet_conditioning_scale": 0.7, "num_inference_steps": 50,
+                       "guidance_scale": 4.5, "control_type": "canny"},
             )
         elif model == "flux-redux-only":
             output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
-                       "num_inference_steps": 28, "guidance_scale": 3.5},
+                       "num_inference_steps": 50, "guidance_scale": 4.5},
             )
         else:  # sdxl-img2img
             output = await asyncio.to_thread(
                 client.run,
                 "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
                 input={"image": open(mass_path, "rb"), "prompt": style_prompt,
-                       "prompt_strength": 0.7, "num_inference_steps": 30, "guidance_scale": 9.0},
+                       "prompt_strength": 0.80, "num_inference_steps": 50, "guidance_scale": 9.0,
+                       "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur"},
             )
 
         output_url = output[0] if isinstance(output, list) else output
@@ -211,8 +218,10 @@ async def run_new_angle(
         jobs[job_id]["status"] = "processing"
 
         combined_prompt = (
-            f"Architectural render of the exact same building, {angle_prompt}, "
-            f"{style_prompt}, photorealistic, professional CGI, 8K, detailed facade"
+            f"award-winning architectural visualization of the exact same building, {angle_prompt}, "
+            f"{style_prompt}, photorealistic CGI render, dramatic cinematic lighting, "
+            "volumetric atmosphere, ultra-detailed facade materials, "
+            "professional architectural photography, hyperrealistic, 8K ultra resolution"
         )
 
         client = get_replicate_client(api_token)
@@ -220,21 +229,21 @@ async def run_new_angle(
             output = await asyncio.to_thread(
                 client.run,
                 "sudo-ai/zero123plus:0e3a8a2cc1f5b88a0c24a40a5fd10d84be4b76c0e83a55a7b1f7c7ac67df5432",
-                input={"image": open(render_path, "rb"), "scale": 4.0, "num_inference_steps": 36},
+                input={"image": open(render_path, "rb"), "scale": 4.0, "num_inference_steps": 50},
             )
         elif model == "flux-redux":
             output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "num_inference_steps": 28, "guidance_scale": 3.5},
+                       "num_inference_steps": 50, "guidance_scale": 4.5},
             )
         else:  # flux-img2img
             output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-dev:a60b88a054a2c9e7f6d5e5c8a42b2d6e7c8f9a1b2c3d4e5f6a7b8c9d0e1f2a3b",
                 input={"image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "prompt_strength": 0.65, "num_inference_steps": 28, "guidance_scale": 3.5},
+                       "prompt_strength": 0.75, "num_inference_steps": 50, "guidance_scale": 4.5},
             )
 
         output_url = output[0] if isinstance(output, list) else output
@@ -257,9 +266,10 @@ async def run_inpaint(
         jobs[job_id]["status"] = "processing"
 
         full_prompt = (
-            f"Photorealistic architectural detail, {prompt}, "
-            "seamlessly integrated, matching surrounding context, "
-            "professional render quality"
+            f"award-winning architectural detail, {prompt}, "
+            "seamlessly integrated, perfectly matching surrounding materials and lighting, "
+            "photorealistic CGI render, ultra-detailed, professional architectural visualization, "
+            "8K resolution, hyperrealistic"
         )
 
         # Decode mask from data URL
@@ -285,10 +295,10 @@ async def run_inpaint(
             "image": image_input,
             "mask": open(mask_path, "rb"),
             "prompt": full_prompt,
-            **({"num_inference_steps": 28, "guidance": 30, "output_format": "png"}
+            **({"num_inference_steps": 50, "guidance": 30, "output_format": "png"}
                if is_flux_fill
-               else {"num_inference_steps": 30, "guidance_scale": 8.5,
-                     "negative_prompt": "low quality, blurry, distorted"}),
+               else {"num_inference_steps": 50, "guidance_scale": 9.0,
+                     "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark"}),
         }
 
         client = get_replicate_client(api_token)
