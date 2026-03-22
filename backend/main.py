@@ -1,5 +1,12 @@
-import os
 import sys
+
+# Ensure Python 3.11+
+if sys.version_info < (3, 11):
+    print(f"ERROR: Python 3.11+ required, running {sys.version}")
+    print("Run with: py -3.11 main.py")
+    sys.exit(1)
+
+import os
 import uuid
 import asyncio
 import base64
