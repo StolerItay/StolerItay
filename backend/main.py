@@ -81,6 +81,52 @@ def get_api_token(api_token: Optional[str] = None) -> str:
     return api_token or os.getenv("REPLICATE_API_TOKEN", "")
 
 
+def get_gemini_key() -> str:
+    return os.getenv("GEMINI_API_KEY", "")
+
+
+async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str:
+    """Use Gemini Vision (REST API) to extract a precise architectural style prompt from an image."""
+    key = get_gemini_key()
+    if not key:
+        return extra_prompt  # fallback: just use the user prompt
+
+    suffix = image_path.suffix.lower().lstrip(".")
+    mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+    b64 = base64.b64encode(image_path.read_bytes()).decode()
+
+    system = (
+        "You are an expert architectural visualization prompter. "
+        "Analyze the image and output ONLY a concise technical prompt (max 130 words) for an AI image generator. "
+        "Describe precisely:\n"
+        "- Facade materials (glass color/finish, metal type/color, stone, wood)\n"
+        "- Structural elements (ribs, fins, lattice, frames — material, color, density)\n"
+        "- Lighting (time of day, warm/cool, accent light colors and placement)\n"
+        "- Sky and atmosphere (color gradient, clouds, haze)\n"
+        "- Vegetation (species, density, terrace/facade integration)\n"
+        "- Overall render quality (photorealistic, CGI, photography style)\n"
+        "Output ONLY the prompt text, no explanations or labels."
+    )
+    if extra_prompt.strip():
+        system += f"\n\nAlso incorporate this user direction: {extra_prompt.strip()}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": system},
+                {"inline_data": {"mime_type": mime, "data": b64}},
+            ]
+        }]
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
 async def replicate_run(model_id: str, input_data: dict, api_token: str) -> str:
     """Call the Replicate REST API directly (no SDK). Returns the output URL."""
 
@@ -165,16 +211,8 @@ async def run_controlnet_render(
 
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
-        style_suffix = (
-            "photorealistic glass curtain wall facade, reflective glass panels with sky reflections, "
-            "photorealistic architectural visualization composited into real aerial photography, "
-            "professional architectural CGI, ultra-detailed glass and steel, "
-            "lush greenery on terraces, warm golden accent lighting, sharp focus, 8K"
-        )
-        if not prompt.strip():
-            full_prompt = style_suffix
-        else:
-            full_prompt = f"{prompt}, {style_suffix}"
+        # Gemini analyzes the existing render → extracts scene lighting, atmosphere, materials.
+        full_prompt = await gemini_describe_style(render_path, prompt)
 
         token = get_api_token(api_token)
 
@@ -219,37 +257,22 @@ async def run_style_transfer(
     try:
         jobs[job_id]["status"] = "processing"
 
-        style_prompt = (
-            "award-winning architectural visualization, "
-            "faithfully matching the style, materials and atmosphere of the reference image, "
-            "photorealistic CGI render, cinematic lighting, ultra-detailed facade, "
-            "professional architectural photography, hyperrealistic, 8K ultra resolution"
-            if not prompt.strip()
-            else (
-                f"award-winning architectural visualization, {prompt}, "
-                "faithfully matching the style, materials and atmosphere of the reference image, "
-                "photorealistic CGI render, cinematic lighting, ultra-detailed facade, "
-                "professional architectural photography, hyperrealistic, 8K ultra resolution"
-            )
-        )
+        # Gemini analyzes the reference image → precise material/lighting description.
+        # Falls back to generic prompt if no GEMINI_API_KEY is set.
+        style_prompt = await gemini_describe_style(reference_path, prompt)
 
         token = get_api_token(api_token)
 
         if model == "flux-redux-controlnet":
-            # Pass the reference image DIRECTLY as the style image (no Redux preprocessing).
-            # Redux compresses style into an embedding that loses fine material detail
-            # (copper ribs, glass panels, structural specifics). Using the reference
-            # directly gives the ControlNet model richer material information.
+            # Gemini prompt + mass canny edges → flux-canny-pro
             output_url = await replicate_run(
-                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
+                "black-forest-labs/flux-canny-pro",
                 {"control_image": open(mass_path, "rb"),
-                 "image": open(reference_path, "rb"),
                  "prompt": style_prompt,
-                 "prompt_strength": 0.90,
-                 "controlnet_conditioning_scale": 0.85,
-                 "num_inference_steps": 50,
-                 "guidance_scale": 5.0,
-                 "control_type": "canny"},
+                 "guidance": 28,
+                 "steps": 28,
+                 "safety_tolerance": 5,
+                 "output_format": "png"},
                 token,
             )
         elif model == "flux-redux-only":
