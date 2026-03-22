@@ -72,13 +72,13 @@ def image_to_data_uri(path: Path) -> str:
 
 CONTROLNET_MODELS = {
     "flux-controlnet-canny": {
-        "id": "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
+        "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
         "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.75,
                    "num_inference_steps": 28, "guidance_scale": 3.5},
     },
     "flux-controlnet-depth": {
-        "id": "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
+        "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
         "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.75,
                    "num_inference_steps": 28, "guidance_scale": 3.5},
@@ -157,7 +157,7 @@ async def run_style_transfer(
             )
             output = await asyncio.to_thread(
                 client.run,
-                "xlabs-ai/flux-dev-controlnet:f2c31c31d81278a91b2447a304dae654c96f5f37f72305b4651489e3dad14f27",
+                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
                 input={"control_image": open(mass_path, "rb"), "prompt": style_prompt,
                        "controlnet_conditioning_scale": 0.7, "num_inference_steps": 28,
                        "guidance_scale": 3.5, "control_type": "canny"},
