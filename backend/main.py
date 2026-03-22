@@ -110,32 +110,60 @@ async def run_controlnet_render(
     try:
         jobs[job_id]["status"] = "processing"
 
-        full_prompt = (
-            f"award-winning architectural visualization, {prompt}, "
-            "photorealistic CGI render, dramatic cinematic lighting, golden hour atmosphere, "
-            "volumetric light rays, ultra-detailed facade materials, glass curtain wall reflections, "
-            "ambient occlusion, ray-traced global illumination, professional architectural photography, "
-            "hyperrealistic, 8K ultra resolution, sharp focus, "
-            "Zaha Hadid Architects quality render, architectural digest cover shot"
-        )
-
         client = get_replicate_client(api_token)
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
-        model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
+        if not prompt.strip():
+            # No prompt: extract style/materials/atmosphere from the original render using Redux,
+            # then constrain the result to the new mass shape with ControlNet.
+            # This preserves the exact materiality, lighting, vegetation and site atmosphere
+            # of the reference render without requiring the user to describe it in text.
+            redux_output = await asyncio.to_thread(
+                client.run,
+                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
+                input={
+                    "redux_image": open(render_path, "rb"),
+                    "num_inference_steps": 50,
+                    "guidance_scale": 4.5,
+                },
+            )
+            redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
 
-        # Pass base render as img2img init so the model preserves the scene context
-        # (lighting, environment, materials) while replacing the building mass.
-        # flux-dev-controlnet supports `image` + `prompt_strength` for img2img conditioning.
-        if model in ("flux-controlnet-canny", "flux-controlnet-depth"):
-            model_input["image"] = open(render_path, "rb")
-            model_input["prompt_strength"] = 0.80  # more creative freedom for higher quality
+            output = await asyncio.to_thread(
+                client.run,
+                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
+                input={
+                    "control_image": open(mass_path, "rb"),
+                    "image": redux_url,
+                    "prompt": "award-winning architectural visualization, photorealistic CGI render, ultra-detailed, 8K ultra resolution",
+                    "prompt_strength": 0.80,
+                    "controlnet_conditioning_scale": 0.7,
+                    "control_type": "canny" if model != "flux-controlnet-depth" else "depth",
+                    "num_inference_steps": 50,
+                    "guidance_scale": 4.5,
+                },
+            )
+        else:
+            full_prompt = (
+                f"award-winning architectural visualization, {prompt}, "
+                "photorealistic CGI render, dramatic cinematic lighting, golden hour atmosphere, "
+                "volumetric light rays, ultra-detailed facade materials, glass curtain wall reflections, "
+                "ambient occlusion, ray-traced global illumination, professional architectural photography, "
+                "hyperrealistic, 8K ultra resolution, sharp focus, "
+                "Zaha Hadid Architects quality render, architectural digest cover shot"
+            )
 
-        output = await asyncio.to_thread(
-            client.run,
-            cfg["id"],
-            input=model_input,
-        )
+            model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
+
+            if model in ("flux-controlnet-canny", "flux-controlnet-depth"):
+                model_input["image"] = open(render_path, "rb")
+                model_input["prompt_strength"] = 0.80
+
+            output = await asyncio.to_thread(
+                client.run,
+                cfg["id"],
+                input=model_input,
+            )
 
         output_url = output[0] if isinstance(output, list) else output
         jobs[job_id].update({"status": "done", "output_url": str(output_url)})
@@ -155,11 +183,20 @@ async def run_style_transfer(
     try:
         jobs[job_id]["status"] = "processing"
 
+        # If no prompt given, let the reference image speak for itself - Redux will extract
+        # all style/material/atmosphere information visually, no text description needed.
         style_prompt = (
-            f"award-winning architectural visualization, {prompt}, "
+            "award-winning architectural visualization, "
             "faithfully matching the style, materials and atmosphere of the reference image, "
             "photorealistic CGI render, cinematic lighting, ultra-detailed facade, "
             "professional architectural photography, hyperrealistic, 8K ultra resolution"
+            if not prompt.strip()
+            else (
+                f"award-winning architectural visualization, {prompt}, "
+                "faithfully matching the style, materials and atmosphere of the reference image, "
+                "photorealistic CGI render, cinematic lighting, ultra-detailed facade, "
+                "professional architectural photography, hyperrealistic, 8K ultra resolution"
+            )
         )
 
         client = get_replicate_client(api_token)
@@ -217,9 +254,12 @@ async def run_new_angle(
     try:
         jobs[job_id]["status"] = "processing"
 
+        # If no style prompt, the render itself is the style reference - Redux will
+        # extract materiality, atmosphere and vegetation directly from the image.
+        style_part = style_prompt.strip() if style_prompt.strip() else "matching the exact materials, lighting and atmosphere of the original render"
         combined_prompt = (
             f"award-winning architectural visualization of the exact same building, {angle_prompt}, "
-            f"{style_prompt}, photorealistic CGI render, dramatic cinematic lighting, "
+            f"{style_part}, photorealistic CGI render, dramatic cinematic lighting, "
             "volumetric atmosphere, ultra-detailed facade materials, "
             "professional architectural photography, hyperrealistic, 8K ultra resolution"
         )
@@ -232,6 +272,7 @@ async def run_new_angle(
                 input={"image": open(render_path, "rb"), "scale": 4.0, "num_inference_steps": 50},
             )
         elif model == "flux-redux":
+            # Redux always uses the render image as visual style reference regardless of text prompt
             output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
