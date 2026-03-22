@@ -14,10 +14,16 @@ const MODELS = [
     note: 'Two-step: Gemini 2.5 Pro deeply analyzes both images and writes a rich architectural prompt, then the image-gen model renders it. Best quality.',
   },
   {
+    id: 'gemini-25-flash',
+    name: 'Gemini 2.5 Flash → Image Gen',
+    tag: 'fast' as const,
+    note: 'Two-step: Gemini 2.5 Flash analyzes both images and writes a detailed prompt, then the image-gen model renders. Faster than Pro.',
+  },
+  {
     id: 'gemini-direct',
     name: 'Gemini 2.0 Flash (Direct)',
     tag: 'fast' as const,
-    note: 'Gemini sees both the mass and reference image and generates the render in one step. No Replicate token needed — only GEMINI_API_KEY.',
+    note: 'Gemini 2.0 Flash sees both images and generates the render in one shot. No separate analysis step.',
   },
   {
     id: 'flux-redux-controlnet',

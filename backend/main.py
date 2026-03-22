@@ -152,8 +152,8 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
     raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
-async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt: str = "") -> str:
-    """Use Gemini 2.5 Pro to deeply analyze mass + reference and produce a detailed render prompt."""
+async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt: str = "", analyzer_model: str = "gemini-2.5-pro") -> str:
+    """Use a Gemini text/vision model to deeply analyze mass + reference and produce a detailed render prompt."""
     key = get_gemini_key()
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
@@ -195,23 +195,17 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
         }],
     }
 
-    # Try 2.5 Pro first, then 2.5 Flash as fallback
-    for _mid in ["gemini-2.5-pro", "gemini-2.5-flash"]:
-        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
-        async with httpx.AsyncClient(timeout=60) as http:
-            r = await http.post(_url, json=payload)
-            if r.status_code in (400, 404):
-                continue
-            r.raise_for_status()
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-
-    raise ValueError("Neither gemini-2.5-pro nor gemini-2.5-flash responded successfully.")
+    _url = f"https://generativelanguage.googleapis.com/v1beta/models/{analyzer_model}:generateContent?key={key}"
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(_url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = "") -> Path:
-    """Two-step: Gemini 2.5 Pro analyzes → writes detailed prompt → image-gen model renders."""
-    rich_prompt = await gemini_25_analyze(mass_path, reference_path, prompt)
+async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = "", analyzer_model: str = "gemini-2.5-pro") -> Path:
+    """Two-step: Gemini analyzer writes detailed prompt → image-gen model renders."""
+    rich_prompt = await gemini_25_analyze(mass_path, reference_path, prompt, analyzer_model)
     return await gemini_generate_render(mass_path, reference_path, rich_prompt)
 
 
@@ -394,9 +388,11 @@ async def run_style_transfer(
         token = get_api_token(api_token)
 
         if model == "gemini-25-pro":
-            # Step 1: Gemini 2.5 Pro/Flash analyzes both images → rich architectural prompt.
-            # Step 2: That prompt + mass → image-gen model renders the result.
-            out_path = await gemini_25_render(mass_path, reference_path, prompt)
+            out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-pro")
+            output_url = f"/outputs/{out_path.name}"
+
+        elif model == "gemini-25-flash":
+            out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash")
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "gemini-direct":
