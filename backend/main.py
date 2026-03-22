@@ -122,18 +122,17 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
     }
 
-    # Try newest image-capable models first; fall back if the model doesn't
-    # support IMAGE responseModality (API returns 400 "not supported").
+    # Try image-capable models in order; skip on 404 (removed) or 400 "not supported".
     _image_gen_models = [
-        "gemini-2.0-flash-preview-image-generation",
         "gemini-2.0-flash-exp",
+        "gemini-2.0-flash-preview-image-generation",
     ]
     data = None
     for _mid in _image_gen_models:
         _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
-            if r.status_code == 400 and "not supported" in r.text.lower():
+            if r.status_code in (404, 400):
                 continue
             r.raise_for_status()
             data = r.json()
