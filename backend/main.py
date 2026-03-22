@@ -134,6 +134,7 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
+            print(f"[Gemini image-gen] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
             if r.status_code in (404, 400):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
