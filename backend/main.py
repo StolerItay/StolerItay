@@ -435,14 +435,16 @@ async def validate_token(token: str = Form(...)):
     import httpx
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(
-                "https://api.replicate.com/v1/account",
-                headers={"Authorization": f"Token {token}"},
-                timeout=8,
-            )
-        if r.status_code == 200:
-            username = r.json().get("username", "")
-            return {"valid": True, "username": username}
+            # Try Bearer first (current Replicate standard), fall back to Token
+            for auth_scheme in ("Bearer", "Token"):
+                r = await client.get(
+                    "https://api.replicate.com/v1/account",
+                    headers={"Authorization": f"{auth_scheme} {token}"},
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    username = r.json().get("username", "")
+                    return {"valid": True, "username": username}
         return {"valid": False, "error": "Invalid token"}
     except Exception as e:
         return {"valid": False, "error": str(e)}
