@@ -1,5 +1,8 @@
 import { useState } from 'react';
-import { RefreshCw, Palette, Camera, Key } from 'lucide-react';
+import { RefreshCw, Palette, Camera, Key, CheckCircle, XCircle, Loader } from 'lucide-react';
+import axios from 'axios';
+
+const BASE = 'http://localhost:8000/api';
 import UpdateRenderTab from './components/UpdateRenderTab';
 import StyleTransferTab from './components/StyleTransferTab';
 import NewAngleTab from './components/NewAngleTab';
@@ -30,6 +33,26 @@ export default function App() {
   const [mode, setMode] = useState<Mode>('update-render');
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [tokenStatus, setTokenStatus] = useState<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
+  const [tokenUser, setTokenUser] = useState('');
+
+  async function validateToken() {
+    if (!apiKey) return;
+    setTokenStatus('checking');
+    try {
+      const form = new FormData();
+      form.append('token', apiKey);
+      const { data } = await axios.post(`${BASE}/validate-token`, form);
+      if (data.valid) {
+        setTokenStatus('valid');
+        setTokenUser(data.username || '');
+      } else {
+        setTokenStatus('invalid');
+      }
+    } catch {
+      setTokenStatus('invalid');
+    }
+  }
 
   return (
     <div className="min-h-screen bg-[#0f0f13] text-gray-100">
@@ -52,7 +75,7 @@ export default function App() {
             <input
               type={showKey ? 'text' : 'password'}
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => { setApiKey(e.target.value); setTokenStatus('idle'); }}
               placeholder="Replicate API token"
               className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200
                 placeholder-gray-600 focus:outline-none focus:border-yellow-500/60 transition-colors"
@@ -63,6 +86,24 @@ export default function App() {
             >
               {showKey ? 'Hide' : 'Show'}
             </button>
+            <button
+              onClick={validateToken}
+              disabled={!apiKey || tokenStatus === 'checking'}
+              className="text-xs px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300
+                hover:border-yellow-500/60 hover:text-yellow-400 transition-colors shrink-0 disabled:opacity-40"
+            >
+              {tokenStatus === 'checking' ? <Loader size={11} className="animate-spin" /> : 'Test'}
+            </button>
+            {tokenStatus === 'valid' && (
+              <span className="flex items-center gap-1 text-xs text-green-400 shrink-0">
+                <CheckCircle size={13} /> {tokenUser}
+              </span>
+            )}
+            {tokenStatus === 'invalid' && (
+              <span className="flex items-center gap-1 text-xs text-red-400 shrink-0">
+                <XCircle size={13} /> Invalid
+              </span>
+            )}
           </div>
         </div>
       </header>

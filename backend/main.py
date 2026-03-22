@@ -378,6 +378,24 @@ async def health():
     return {"status": "ok", "replicate_configured": bool(os.getenv("REPLICATE_API_TOKEN"))}
 
 
+@app.post("/api/validate-token")
+async def validate_token(token: str = Form(...)):
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.replicate.com/v1/account",
+                headers={"Authorization": f"Token {token}"},
+                timeout=8,
+            )
+        if r.status_code == 200:
+            username = r.json().get("username", "")
+            return {"valid": True, "username": username}
+        return {"valid": False, "error": "Invalid token"}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
 # ── Serve React frontend (must be last) ─────────────────────────────────────
 
 FRONTEND_DIST = BUNDLE_DIR / "frontend_dist"
