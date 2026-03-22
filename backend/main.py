@@ -85,6 +85,59 @@ def get_gemini_key() -> str:
     return os.getenv("GEMINI_API_KEY", "")
 
 
+async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: str = "") -> Path:
+    """Send mass + reference to Gemini 2.0 Flash image generation. Returns saved output path."""
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    mass_b64, mass_mime = _b64(mass_path)
+    ref_b64, ref_mime = _b64(reference_path)
+
+    instruction = (
+        "You are an expert architectural visualization artist. "
+        "The first image is an architectural mass/volume model (a simplified 3D building shape). "
+        "The second image is a reference architectural render showing the desired style. "
+        "Generate a photorealistic architectural visualization of the building mass that exactly matches "
+        "the reference's facade materials, glass type and color, structural elements, lighting, sky, "
+        "vegetation, and overall atmosphere. Preserve the building geometry from the first image. "
+        "Output only the rendered image, no text."
+    )
+    if prompt.strip():
+        instruction += f" Additional direction: {prompt.strip()}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+                {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+            ]
+        }],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={key}"
+    async with httpx.AsyncClient(timeout=120) as http:
+        r = await http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        if "inline_data" in part:
+            img_bytes = base64.b64decode(part["inline_data"]["data"])
+            out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+            out_path.write_bytes(img_bytes)
+            return out_path
+
+    raise ValueError(f"Gemini returned no image. Response: {data}")
+
+
 async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str:
     """Use Gemini Vision (REST API) to extract a precise architectural style prompt from an image."""
     key = get_gemini_key()
@@ -263,7 +316,13 @@ async def run_style_transfer(
 
         token = get_api_token(api_token)
 
-        if model == "flux-redux-controlnet":
+        if model == "gemini-direct":
+            # Gemini generates the render directly from mass + reference images.
+            # No Replicate token needed for this path.
+            out_path = await gemini_generate_render(mass_path, reference_path, prompt)
+            output_url = f"/outputs/{out_path.name}"
+
+        elif model == "flux-redux-controlnet":
             # Gemini prompt + mass canny edges → flux-canny-pro
             output_url = await replicate_run(
                 "black-forest-labs/flux-canny-pro",

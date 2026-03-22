@@ -8,10 +8,16 @@ import { submitStyleTransfer } from '../api';
 
 const MODELS = [
   {
-    id: 'flux-redux-controlnet',
-    name: 'Flux Redux → Flux ControlNet',
+    id: 'gemini-direct',
+    name: 'Gemini 2.0 Flash (Direct)',
     tag: 'recommended' as const,
-    note: 'Two-step: Redux extracts style from reference, ControlNet constrains to mass shape.',
+    note: 'Gemini sees both the mass and reference image and generates the render directly. No Replicate token needed — only GEMINI_API_KEY.',
+  },
+  {
+    id: 'flux-redux-controlnet',
+    name: 'Flux Canny Pro + Gemini Prompt',
+    tag: 'precise' as const,
+    note: 'Gemini describes the reference style → Flux Canny Pro applies it constrained to the mass edges.',
   },
   {
     id: 'flux-redux-only',
