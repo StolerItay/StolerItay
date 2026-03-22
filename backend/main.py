@@ -13,7 +13,7 @@ import base64
 from pathlib import Path
 from typing import Optional
 
-import replicate
+import httpx
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -77,9 +77,59 @@ def image_to_data_uri(path: Path) -> str:
     return f"data:{mime};base64,{data}"
 
 
+def get_api_token(api_token: Optional[str] = None) -> str:
+    return api_token or os.getenv("REPLICATE_API_TOKEN", "")
+
+
+async def replicate_run(model_id: str, input_data: dict, api_token: str) -> str:
+    """Call the Replicate REST API directly (no SDK). Returns the output URL."""
+
+    # Convert any open file handles to base64 data URIs
+    processed: dict = {}
+    for key, value in input_data.items():
+        if hasattr(value, "read"):
+            raw = value.read()
+            mime = "image/png" if raw[:4] == b"\x89PNG" else "image/jpeg"
+            processed[key] = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+        else:
+            processed[key] = value
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+
+    # Official models have no ":" (e.g. "black-forest-labs/flux-canny-pro").
+    # Versioned community models include a hash after ":" (e.g. "owner/model:abc123").
+    if ":" in model_id:
+        url = "https://api.replicate.com/v1/predictions"
+        _, version = model_id.rsplit(":", 1)
+        payload: dict = {"version": version, "input": processed}
+    else:
+        url = f"https://api.replicate.com/v1/models/{model_id}/predictions"
+        payload = {"input": processed}
+
+    async with httpx.AsyncClient(timeout=300) as http:
+        r = await http.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        prediction = r.json()
+
+        # Poll until the prediction finishes
+        get_url = prediction["urls"]["get"]
+        while prediction["status"] not in ("succeeded", "failed", "canceled"):
+            await asyncio.sleep(2)
+            r = await http.get(get_url, headers=headers)
+            r.raise_for_status()
+            prediction = r.json()
+
+        if prediction["status"] != "succeeded":
+            raise RuntimeError(f"Replicate prediction failed: {prediction.get('error')}")
+
+        output = prediction["output"]
+        return output[0] if isinstance(output, list) else str(output)
+
+
 # Official BFL serverless models — no version hash needed.
-# flux-canny-pro / flux-depth-pro are the highest-quality structure-guided
-# generation models available on Replicate.
 CONTROLNET_MODELS = {
     "flux-controlnet-canny": {
         "id": "black-forest-labs/flux-canny-pro",
@@ -91,7 +141,6 @@ CONTROLNET_MODELS = {
         "input_key": "control_image",
         "extra": {"guidance": 15, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
     },
-    # Community SDXL fallback (still uses a version hash but is widely available)
     "sdxl-controlnet": {
         "id": "diffusers/controlnet-canny-sdxl-1.0:a398a399f1238d5651c7bb7b5417823f1d559fc2ab1b7fa3f06a45d57c971db4",
         "input_key": "image",
@@ -100,11 +149,6 @@ CONTROLNET_MODELS = {
                    "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark, text"},
     },
 }
-
-
-def get_replicate_client(api_token: Optional[str] = None) -> replicate.Client:
-    token = api_token or os.getenv("REPLICATE_API_TOKEN", "")
-    return replicate.Client(api_token=token)
 
 
 async def run_controlnet_render(
@@ -119,14 +163,9 @@ async def run_controlnet_render(
     try:
         jobs[job_id]["status"] = "processing"
 
-        client = get_replicate_client(api_token)
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
-        # When prompt is empty, use the original render as a visual style reference:
-        # Redux extracts its materials/atmosphere, then we describe it as a rich default.
         if not prompt.strip():
-            # Single-step: flux-canny-pro/depth-pro generate directly from the mass structure.
-            # Redux step removed here — canny-pro produces far superior results in one pass.
             full_prompt = (
                 "award-winning architectural visualization, photorealistic CGI render, "
                 "dramatic cinematic lighting, golden hour atmosphere, ultra-detailed facade materials, "
@@ -146,18 +185,12 @@ async def run_controlnet_render(
 
         model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
 
-        # SDXL fallback: add negative prompt and doesn't use BFL param names
         if model == "sdxl-controlnet":
             model_input["image"] = open(render_path, "rb")
 
-        output = await asyncio.to_thread(
-            client.run,
-            cfg["id"],
-            input=model_input,
-        )
-
-        output_url = output[0] if isinstance(output, list) else output
-        jobs[job_id].update({"status": "done", "output_url": str(output_url)})
+        token = get_api_token(api_token)
+        output_url = await replicate_run(cfg["id"], model_input, token)
+        jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
 
@@ -174,8 +207,6 @@ async def run_style_transfer(
     try:
         jobs[job_id]["status"] = "processing"
 
-        # If no prompt given, let the reference image speak for itself - Redux will extract
-        # all style/material/atmosphere information visually, no text description needed.
         style_prompt = (
             "award-winning architectural visualization, "
             "faithfully matching the style, materials and atmosphere of the reference image, "
@@ -190,44 +221,43 @@ async def run_style_transfer(
             )
         )
 
-        client = get_replicate_client(api_token)
+        token = get_api_token(api_token)
+
         if model == "flux-redux-controlnet":
             # Step 1: Redux extracts style/look from the reference image
-            redux_output = await asyncio.to_thread(
-                client.run,
+            redux_url = await replicate_run(
                 "black-forest-labs/flux-redux-dev",
-                input={"redux_image": open(reference_path, "rb"),
-                       "num_inference_steps": 50, "guidance": 3.5},
+                {"redux_image": open(reference_path, "rb"),
+                 "num_inference_steps": 50, "guidance": 3.5},
+                token,
             )
-            redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
 
             # Step 2: ControlNet constrains the redux-styled image to the mass shape
-            output = await asyncio.to_thread(
-                client.run,
+            output_url = await replicate_run(
                 "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
-                input={"control_image": open(mass_path, "rb"), "image": redux_url,
-                       "prompt": style_prompt, "prompt_strength": 0.80,
-                       "controlnet_conditioning_scale": 0.7, "num_inference_steps": 50,
-                       "guidance_scale": 4.5, "control_type": "canny"},
+                {"control_image": open(mass_path, "rb"), "image": redux_url,
+                 "prompt": style_prompt, "prompt_strength": 0.80,
+                 "controlnet_conditioning_scale": 0.7, "num_inference_steps": 50,
+                 "guidance_scale": 4.5, "control_type": "canny"},
+                token,
             )
         elif model == "flux-redux-only":
-            output = await asyncio.to_thread(
-                client.run,
+            output_url = await replicate_run(
                 "black-forest-labs/flux-redux-dev",
-                input={"redux_image": open(reference_path, "rb"),
-                       "num_inference_steps": 50, "guidance": 3.5},
+                {"redux_image": open(reference_path, "rb"),
+                 "num_inference_steps": 50, "guidance": 3.5},
+                token,
             )
         else:  # sdxl-img2img
-            output = await asyncio.to_thread(
-                client.run,
+            output_url = await replicate_run(
                 "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-                input={"image": open(mass_path, "rb"), "prompt": style_prompt,
-                       "prompt_strength": 0.80, "num_inference_steps": 50, "guidance_scale": 9.0,
-                       "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur"},
+                {"image": open(mass_path, "rb"), "prompt": style_prompt,
+                 "prompt_strength": 0.80, "num_inference_steps": 50, "guidance_scale": 9.0,
+                 "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur"},
+                token,
             )
 
-        output_url = output[0] if isinstance(output, list) else output
-        jobs[job_id].update({"status": "done", "output_url": str(output_url)})
+        jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
 
@@ -245,8 +275,6 @@ async def run_new_angle(
     try:
         jobs[job_id]["status"] = "processing"
 
-        # If no style prompt, the render itself is the style reference - Redux will
-        # extract materiality, atmosphere and vegetation directly from the image.
         style_part = style_prompt.strip() if style_prompt.strip() else "matching the exact materials, lighting and atmosphere of the original render"
         combined_prompt = (
             f"award-winning architectural visualization of the exact same building, {angle_prompt}, "
@@ -255,34 +283,31 @@ async def run_new_angle(
             "professional architectural photography, hyperrealistic, 8K ultra resolution"
         )
 
-        client = get_replicate_client(api_token)
+        token = get_api_token(api_token)
+
         if model == "zero123plus":
-            # zero123plus is not available on Replicate; use flux-canny-pro instead for
-            # structure-accurate new angles from the source render.
-            output = await asyncio.to_thread(
-                client.run,
+            output_url = await replicate_run(
                 "black-forest-labs/flux-canny-pro",
-                input={"control_image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "guidance": 25, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
+                {"control_image": open(render_path, "rb"), "prompt": combined_prompt,
+                 "guidance": 25, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
+                token,
             )
         elif model == "flux-redux":
-            # Redux preserves the building identity while the angle prompt steers the composition.
-            output = await asyncio.to_thread(
-                client.run,
+            output_url = await replicate_run(
                 "black-forest-labs/flux-redux-dev",
-                input={"redux_image": open(render_path, "rb"),
-                       "num_inference_steps": 50, "guidance": 3.5},
+                {"redux_image": open(render_path, "rb"),
+                 "num_inference_steps": 50, "guidance": 3.5},
+                token,
             )
-        else:  # flux-img2img — flux-dev serverless, no version hash, use `strength` not `prompt_strength`
-            output = await asyncio.to_thread(
-                client.run,
+        else:  # flux-img2img
+            output_url = await replicate_run(
                 "black-forest-labs/flux-dev",
-                input={"image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "strength": 0.75, "num_inference_steps": 28, "guidance": 3.5},
+                {"image": open(render_path, "rb"), "prompt": combined_prompt,
+                 "strength": 0.75, "num_inference_steps": 28, "guidance": 3.5},
+                token,
             )
 
-        output_url = output[0] if isinstance(output, list) else output
-        jobs[job_id].update({"status": "done", "output_url": str(output_url)})
+        jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
 
@@ -336,15 +361,9 @@ async def run_inpaint(
                      "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark"}),
         }
 
-        client = get_replicate_client(api_token)
-        output = await asyncio.to_thread(
-            client.run,
-            inpaint_model_id,
-            input=model_input,
-        )
-
-        output_url = output[0] if isinstance(output, list) else output
-        jobs[job_id].update({"status": "done", "output_url": str(output_url)})
+        token = get_api_token(api_token)
+        output_url = await replicate_run(inpaint_model_id, model_input, token)
+        jobs[job_id].update({"status": "done", "output_url": output_url})
         mask_path.unlink(missing_ok=True)
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
@@ -439,12 +458,10 @@ async def health():
 
 @app.post("/api/validate-token")
 async def validate_token(token: str = Form(...)):
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            # Try Bearer first (current Replicate standard), fall back to Token
+        async with httpx.AsyncClient() as http:
             for auth_scheme in ("Bearer", "Token"):
-                r = await client.get(
+                r = await http.get(
                     "https://api.replicate.com/v1/account",
                     headers={"Authorization": f"{auth_scheme} {token}"},
                     timeout=8,

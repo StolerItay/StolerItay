@@ -12,36 +12,21 @@ Run:
 import base64
 import io
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
-# Patch replicate before importing main so no real API calls ever happen
-import replicate as _replicate_mod
 
 FAKE_OUTPUT_URL = "https://example.com/result.png"
 
 
 @pytest.fixture(autouse=True)
 def mock_replicate(monkeypatch):
-    """Replace replicate.Client.run with a fake that returns a URL immediately.
+    """Replace replicate_run with a fake that returns a URL immediately."""
+    async def _fake_run(model_id, input_data, api_token):
+        return FAKE_OUTPUT_URL
 
-    Also patches asyncio.to_thread in main.py so background tasks complete
-    synchronously during TestClient polling, including multi-step pipelines
-    (e.g. Redux → ControlNet) that make two sequential thread calls.
-    """
-    fake_client = MagicMock()
-    fake_client.run.return_value = [FAKE_OUTPUT_URL]
-    monkeypatch.setattr("replicate.Client", lambda **kw: fake_client)
-
-    # Make asyncio.to_thread call the function directly (no real thread)
-    # so coroutines complete in one event-loop tick.
-    async def _instant_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr("main.asyncio.to_thread", _instant_to_thread)
-    return fake_client
+    monkeypatch.setattr("main.replicate_run", _fake_run)
 
 
 # Import app after patching
@@ -76,12 +61,7 @@ def _data_uri_mask() -> str:
 
 
 def _wait_for_job(job_id: str, timeout_steps: int = 30) -> dict:
-    """Poll /api/job/{id} until done or error.
-
-    Each GET request gives the async event loop a chance to advance pending
-    background tasks.  Two-step pipelines (e.g. Redux → ControlNet) need a
-    couple of extra ticks, hence the higher default.
-    """
+    """Poll /api/job/{id} until done or error."""
     import time
     data = {"status": "pending"}
     for _ in range(timeout_steps):
@@ -90,7 +70,7 @@ def _wait_for_job(job_id: str, timeout_steps: int = 30) -> dict:
         data = r.json()
         if data["status"] in ("done", "error"):
             return data
-        time.sleep(0.01)  # yield to event loop between polls
+        time.sleep(0.01)
     return data  # type: ignore[return-value]
 
 
@@ -130,7 +110,6 @@ class TestUpdateRender:
             data={"prompt": "concrete panels"},
         )
         job_id = r.json()["jobId"]
-        # TestClient runs background tasks synchronously
         result = _wait_for_job(job_id)
         assert result["status"] == "done"
         assert FAKE_OUTPUT_URL in result.get("output_url", "")
@@ -291,17 +270,15 @@ class TestHelpers:
     def test_image_to_data_uri_jpg(self, tmp_path):
         from main import image_to_data_uri
         f = tmp_path / "img.jpg"
-        f.write_bytes(b"\xff\xd8\xff" + b"\x00" * 10)  # minimal JPG-like bytes
+        f.write_bytes(b"\xff\xd8\xff" + b"\x00" * 10)
         uri = image_to_data_uri(f)
         assert uri.startswith("data:image/jpeg;base64,")
 
-    def test_get_replicate_client_uses_env(self, monkeypatch):
-        from main import get_replicate_client
+    def test_get_api_token_uses_env(self, monkeypatch):
+        from main import get_api_token
         monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_test_token")
-        c = get_replicate_client()
-        assert c is not None
+        assert get_api_token() == "r8_test_token"
 
-    def test_get_replicate_client_uses_param(self):
-        from main import get_replicate_client
-        c = get_replicate_client("r8_custom_token")
-        assert c is not None
+    def test_get_api_token_uses_param(self):
+        from main import get_api_token
+        assert get_api_token("r8_custom_token") == "r8_custom_token"
