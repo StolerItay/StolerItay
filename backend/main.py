@@ -124,9 +124,8 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
 
     # Try image-capable models in order; skip on 404 (removed) or unsupported 400.
     _image_gen_models = [
-        "gemini-2.0-flash-exp-image-generation",
-        "gemini-2.0-flash-exp",
-        "gemini-2.0-flash-preview-image-generation",
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
     ]
     data = None
     _errors: list[str] = []
