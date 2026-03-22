@@ -29,6 +29,39 @@ def mock_replicate(monkeypatch):
     monkeypatch.setattr("main.replicate_run", _fake_run)
 
 
+@pytest.fixture(autouse=True)
+def mock_gemini(monkeypatch, tmp_path):
+    """Mock all Gemini API functions so tests run offline."""
+    import struct, zlib
+
+    def _png_bytes_local():
+        def chunk(tag, data):
+            c = struct.pack(">I", len(data)) + tag + data
+            return c + struct.pack(">I", zlib.crc32(c[4:]) & 0xFFFFFFFF)
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        idat = chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
+        iend = chunk(b"IEND", b"")
+        return sig + ihdr + idat + iend
+
+    async def _fake_gemini_render(mass_path, reference_path, prompt=""):
+        out = tmp_path / f"fake_gemini_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
+    async def _fake_gemini_25_render(mass_path, reference_path, prompt="", analyzer_model="gemini-2.5-pro"):
+        out = tmp_path / f"fake_gemini25_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
+    async def _fake_gemini_describe(image_path, extra_prompt=""):
+        return extra_prompt or "modern glass and steel facade"
+
+    monkeypatch.setattr("main.gemini_generate_render", _fake_gemini_render)
+    monkeypatch.setattr("main.gemini_25_render", _fake_gemini_25_render)
+    monkeypatch.setattr("main.gemini_describe_style", _fake_gemini_describe)
+
+
 # Import app after patching
 from main import app, jobs  # noqa: E402
 
@@ -123,6 +156,17 @@ class TestUpdateRender:
             )
             assert r.status_code == 200, f"model {model} rejected"
 
+    def test_controlnet_models_reach_done(self):
+        """Flux Canny/Depth Pro must complete successfully (not fall back to flux-dev)."""
+        for model in ("flux-controlnet-canny", "flux-controlnet-depth"):
+            r = client.post(
+                "/api/update-render",
+                files={"render": _png_file(), "mass": _png_file()},
+                data={"model": model},
+            )
+            result = _wait_for_job(r.json()["jobId"])
+            assert result["status"] == "done", f"{model} failed: {result}"
+
 
 # ── /api/style-transfer ──────────────────────────────────────────────────────
 
@@ -153,6 +197,32 @@ class TestStyleTransfer:
         job_id = r.json()["jobId"]
         result = _wait_for_job(job_id)
         assert result["status"] == "done"
+
+    @pytest.mark.parametrize("model", [
+        "gemini-25-pro", "gemini-25-flash", "gemini-direct",
+        "flux-redux-controlnet", "flux-redux-only", "sdxl-img2img",
+    ])
+    def test_all_models_reach_done(self, model):
+        r = client.post(
+            "/api/style-transfer",
+            files={"reference": _png_file(), "mass": _png_file()},
+            data={"model": model},
+        )
+        assert r.status_code == 200, f"model {model} rejected at submission"
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done", f"model {model} did not reach done: {result}"
+
+    def test_gemini_models_return_local_url(self):
+        """Gemini models save locally and return /outputs/… path, not an external URL."""
+        for model in ("gemini-25-pro", "gemini-25-flash", "gemini-direct"):
+            r = client.post(
+                "/api/style-transfer",
+                files={"reference": _png_file(), "mass": _png_file()},
+                data={"model": model},
+            )
+            result = _wait_for_job(r.json()["jobId"])
+            assert result["output_url"].startswith("/outputs/"), \
+                f"{model} returned unexpected url: {result['output_url']}"
 
 
 # ── /api/new-angle ───────────────────────────────────────────────────────────

@@ -348,21 +348,14 @@ async def run_controlnet_render(
                 "prompt": full_prompt,
                 **cfg["extra"],
             }
-            output_url = await replicate_run(cfg["id"], model_input, token)
         else:
-            # Primary pipeline: img2img directly on the mass composite.
-            # The mass is already placed in the real photo at the correct position/scale.
-            # flux-dev transforms the flat 3D building surfaces → photorealistic glass
-            # while preserving the surrounding city background (strength < 1.0).
-            output_url = await replicate_run(
-                "black-forest-labs/flux-dev",
-                {"image": open(mass_path, "rb"),
-                 "prompt": full_prompt,
-                 "strength": 0.78,
-                 "num_inference_steps": 50,
-                 "guidance": 5.0},
-                token,
-            )
+            # BFL Canny Pro / Depth Pro: mass is the structural guide image
+            model_input = {
+                cfg["input_key"]: open(mass_path, "rb"),
+                "prompt": full_prompt,
+                **cfg["extra"],
+            }
+        output_url = await replicate_run(cfg["id"], model_input, token)
 
         jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
@@ -381,10 +374,6 @@ async def run_style_transfer(
     try:
         jobs[job_id]["status"] = "processing"
 
-        # Gemini analyzes the reference image → precise material/lighting description.
-        # Falls back to generic prompt if no GEMINI_API_KEY is set.
-        style_prompt = await gemini_describe_style(reference_path, prompt)
-
         token = get_api_token(api_token)
 
         if model == "gemini-25-pro":
@@ -396,13 +385,11 @@ async def run_style_transfer(
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "gemini-direct":
-            # Gemini generates the render directly from mass + reference images.
-            # No Replicate token needed for this path.
             out_path = await gemini_generate_render(mass_path, reference_path, prompt)
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "flux-redux-controlnet":
-            # Gemini prompt + mass canny edges → flux-canny-pro
+            style_prompt = await gemini_describe_style(reference_path, prompt)
             output_url = await replicate_run(
                 "black-forest-labs/flux-canny-pro",
                 {"control_image": open(mass_path, "rb"),
@@ -421,6 +408,7 @@ async def run_style_transfer(
                 token,
             )
         else:  # sdxl-img2img
+            style_prompt = await gemini_describe_style(reference_path, prompt)
             output_url = await replicate_run(
                 "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
                 {"image": open(mass_path, "rb"), "prompt": style_prompt,

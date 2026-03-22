@@ -136,32 +136,22 @@ export default function InpaintCanvas({ imageUrl, onDone, onNewResult }: Props) 
 
   const getMaskDataUrl = (): string => {
     const mc = maskCanvasRef.current!;
-    // Create a black-and-white mask: painted areas = white, rest = black
-    const temp = document.createElement('canvas');
-    temp.width = mc.width;
-    temp.height = mc.height;
-    const ctx = temp.getContext('2d')!;
-    ctx.fillStyle = 'black';
-    ctx.fillRect(0, 0, temp.width, temp.height);
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.drawImage(mc, 0, 0);
-    // invert: painted area becomes white
-    const tempInv = document.createElement('canvas');
-    tempInv.width = mc.width;
-    tempInv.height = mc.height;
-    const ctxInv = tempInv.getContext('2d')!;
-    ctxInv.fillStyle = 'white';
-    ctxInv.fillRect(0, 0, tempInv.width, tempInv.height);
-    ctxInv.globalCompositeOperation = 'destination-out';
-    ctxInv.drawImage(temp, 0, 0);
-    // Actually, just export what we have as white mask
+    const w = mc.width, h = mc.height;
+    // White canvas masked by the painted strokes' alpha → white where painted, transparent elsewhere
+    const whiteCanvas = document.createElement('canvas');
+    whiteCanvas.width = w; whiteCanvas.height = h;
+    const wCtx = whiteCanvas.getContext('2d')!;
+    wCtx.fillStyle = 'white';
+    wCtx.fillRect(0, 0, w, h);
+    wCtx.globalCompositeOperation = 'destination-in';
+    wCtx.drawImage(mc, 0, 0);
+    // Composite white strokes onto black background → standard B&W inpaint mask
     const finalCanvas = document.createElement('canvas');
-    finalCanvas.width = mc.width;
-    finalCanvas.height = mc.height;
+    finalCanvas.width = w; finalCanvas.height = h;
     const fCtx = finalCanvas.getContext('2d')!;
     fCtx.fillStyle = 'black';
-    fCtx.fillRect(0, 0, finalCanvas.width, finalCanvas.height);
-    fCtx.drawImage(mc, 0, 0);
+    fCtx.fillRect(0, 0, w, h);
+    fCtx.drawImage(whiteCanvas, 0, 0);
     return finalCanvas.toDataURL('image/png');
   };
 
