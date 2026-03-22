@@ -9,15 +9,15 @@ import { submitUpdateRender } from '../api';
 const MODELS = [
   {
     id: 'flux-controlnet-canny',
-    name: 'Flux Dev ControlNet — Canny',
+    name: 'Flux Canny Pro (BFL)',
     tag: 'recommended' as const,
-    note: 'Best quality. Uses edge detection on the mass to guide generation.',
+    note: 'Best quality. Official Black Forest Labs model — edge-guided generation at highest fidelity.',
   },
   {
     id: 'flux-controlnet-depth',
-    name: 'Flux Dev ControlNet — Depth',
+    name: 'Flux Depth Pro (BFL)',
     tag: 'fast' as const,
-    note: 'Better for masses with clear depth variation or 3D screenshots.',
+    note: 'Best for masses with strong 3D depth variation. Official BFL depth-guided model.',
   },
   {
     id: 'sdxl-controlnet',

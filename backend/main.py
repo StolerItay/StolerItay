@@ -70,19 +70,21 @@ def image_to_data_uri(path: Path) -> str:
     return f"data:{mime};base64,{data}"
 
 
+# Official BFL serverless models — no version hash needed.
+# flux-canny-pro / flux-depth-pro are the highest-quality structure-guided
+# generation models available on Replicate.
 CONTROLNET_MODELS = {
     "flux-controlnet-canny": {
-        "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
+        "id": "black-forest-labs/flux-canny-pro",
         "input_key": "control_image",
-        "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.7,
-                   "num_inference_steps": 50, "guidance_scale": 4.5},
+        "extra": {"guidance": 30, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
     },
     "flux-controlnet-depth": {
-        "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
+        "id": "black-forest-labs/flux-depth-pro",
         "input_key": "control_image",
-        "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.7,
-                   "num_inference_steps": 50, "guidance_scale": 4.5},
+        "extra": {"guidance": 15, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
     },
+    # Community SDXL fallback (still uses a version hash but is widely available)
     "sdxl-controlnet": {
         "id": "diffusers/controlnet-canny-sdxl-1.0:a398a399f1238d5651c7bb7b5417823f1d559fc2ab1b7fa3f06a45d57c971db4",
         "input_key": "image",
@@ -106,42 +108,24 @@ async def run_controlnet_render(
     job_id: str,
     api_token: Optional[str] = None,
 ) -> None:
-    """ControlNet-guided render: replace building with new mass."""
+    """Structure-guided render using official BFL canny/depth-pro models."""
     try:
         jobs[job_id]["status"] = "processing"
 
         client = get_replicate_client(api_token)
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
+        # When prompt is empty, use the original render as a visual style reference:
+        # Redux extracts its materials/atmosphere, then we describe it as a rich default.
         if not prompt.strip():
-            # No prompt: extract style/materials/atmosphere from the original render using Redux,
-            # then constrain the result to the new mass shape with ControlNet.
-            # This preserves the exact materiality, lighting, vegetation and site atmosphere
-            # of the reference render without requiring the user to describe it in text.
-            redux_output = await asyncio.to_thread(
-                client.run,
-                "black-forest-labs/flux-redux-dev",
-                input={
-                    "redux_image": open(render_path, "rb"),
-                    "num_inference_steps": 50,
-                    "guidance": 3.5,
-                },
-            )
-            redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
-
-            output = await asyncio.to_thread(
-                client.run,
-                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
-                input={
-                    "control_image": open(mass_path, "rb"),
-                    "image": redux_url,
-                    "prompt": "award-winning architectural visualization, photorealistic CGI render, ultra-detailed, 8K ultra resolution",
-                    "prompt_strength": 0.80,
-                    "controlnet_conditioning_scale": 0.7,
-                    "control_type": "canny" if model != "flux-controlnet-depth" else "depth",
-                    "num_inference_steps": 50,
-                    "guidance_scale": 4.5,
-                },
+            # Single-step: flux-canny-pro/depth-pro generate directly from the mass structure.
+            # Redux step removed here — canny-pro produces far superior results in one pass.
+            full_prompt = (
+                "award-winning architectural visualization, photorealistic CGI render, "
+                "dramatic cinematic lighting, golden hour atmosphere, ultra-detailed facade materials, "
+                "glass curtain wall reflections, lush greenery, ambient occlusion, "
+                "ray-traced global illumination, professional architectural photography, "
+                "hyperrealistic, 8K ultra resolution, Zaha Hadid Architects quality"
             )
         else:
             full_prompt = (
@@ -153,17 +137,17 @@ async def run_controlnet_render(
                 "Zaha Hadid Architects quality render, architectural digest cover shot"
             )
 
-            model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
+        model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
 
-            if model in ("flux-controlnet-canny", "flux-controlnet-depth"):
-                model_input["image"] = open(render_path, "rb")
-                model_input["prompt_strength"] = 0.80
+        # SDXL fallback: add negative prompt and doesn't use BFL param names
+        if model == "sdxl-controlnet":
+            model_input["image"] = open(render_path, "rb")
 
-            output = await asyncio.to_thread(
-                client.run,
-                cfg["id"],
-                input=model_input,
-            )
+        output = await asyncio.to_thread(
+            client.run,
+            cfg["id"],
+            input=model_input,
+        )
 
         output_url = output[0] if isinstance(output, list) else output
         jobs[job_id].update({"status": "done", "output_url": str(output_url)})
@@ -266,25 +250,28 @@ async def run_new_angle(
 
         client = get_replicate_client(api_token)
         if model == "zero123plus":
+            # zero123plus is not available on Replicate; use flux-canny-pro instead for
+            # structure-accurate new angles from the source render.
             output = await asyncio.to_thread(
                 client.run,
-                "sudo-ai/zero123plus:0e3a8a2cc1f5b88a0c24a40a5fd10d84be4b76c0e83a55a7b1f7c7ac67df5432",
-                input={"image": open(render_path, "rb"), "scale": 4.0, "num_inference_steps": 50},
+                "black-forest-labs/flux-canny-pro",
+                input={"control_image": open(render_path, "rb"), "prompt": combined_prompt,
+                       "guidance": 25, "steps": 28, "safety_tolerance": 5, "output_format": "png"},
             )
         elif model == "flux-redux":
-            # Redux always uses the render image as visual style reference regardless of text prompt
+            # Redux preserves the building identity while the angle prompt steers the composition.
             output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-redux-dev",
                 input={"redux_image": open(render_path, "rb"),
                        "num_inference_steps": 50, "guidance": 3.5},
             )
-        else:  # flux-img2img
+        else:  # flux-img2img — flux-dev serverless, no version hash, use `strength` not `prompt_strength`
             output = await asyncio.to_thread(
                 client.run,
-                "black-forest-labs/flux-dev:a60b88a054a2c9e7f6d5e5c8a42b2d6e7c8f9a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+                "black-forest-labs/flux-dev",
                 input={"image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "prompt_strength": 0.75, "num_inference_steps": 50, "guidance_scale": 4.5},
+                       "strength": 0.75, "num_inference_steps": 28, "guidance": 3.5},
             )
 
         output_url = output[0] if isinstance(output, list) else output

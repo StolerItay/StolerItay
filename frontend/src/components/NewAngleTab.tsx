@@ -17,21 +17,21 @@ const ANGLE_PRESETS = [
 const MODELS = [
   {
     id: 'zero123plus',
-    name: 'Zero123++',
+    name: 'Flux Canny Pro (BFL)',
     tag: 'recommended' as const,
-    note: 'True novel-view synthesis. Geometrically accurate new angles from a single image.',
+    note: 'Best quality. Uses the source render as a structural guide via edge detection.',
   },
   {
     id: 'flux-redux',
-    name: 'Flux Redux (prompt-guided)',
+    name: 'Flux Redux (style-preserving)',
     tag: 'fast' as const,
-    note: 'Preserves building identity while steering the viewpoint via text prompt.',
+    note: 'Preserves building identity and materials while exploring new compositions.',
   },
   {
     id: 'flux-img2img',
     name: 'Flux Dev img2img',
     tag: 'fallback' as const,
-    note: 'Standard img2img. Less geometrically precise, more stylised output.',
+    note: 'Standard img2img. Looser, more creative, less structurally precise.',
   },
 ];
 
