@@ -208,10 +208,10 @@ async def run_controlnet_render(
                 {"control_image": open(mass_path, "rb"),
                  "image": redux_url,
                  "prompt": full_prompt,
-                 "prompt_strength": 0.85,
-                 "controlnet_conditioning_scale": 0.75,
+                 "prompt_strength": 0.80,
+                 "controlnet_conditioning_scale": 0.85,
                  "num_inference_steps": 50,
-                 "guidance_scale": 4.5,
+                 "guidance_scale": 5.0,
                  "control_type": "canny"},
                 token,
             )
