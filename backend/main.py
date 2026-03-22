@@ -165,23 +165,16 @@ async def run_controlnet_render(
 
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
+        style_suffix = (
+            "photorealistic glass curtain wall facade, reflective glass panels with sky reflections, "
+            "photorealistic architectural visualization composited into real aerial photography, "
+            "professional architectural CGI, ultra-detailed glass and steel, "
+            "lush greenery on terraces, warm golden accent lighting, sharp focus, 8K"
+        )
         if not prompt.strip():
-            full_prompt = (
-                "award-winning architectural visualization, photorealistic CGI render, "
-                "dramatic cinematic lighting, golden hour atmosphere, ultra-detailed facade materials, "
-                "glass curtain wall reflections, lush greenery, ambient occlusion, "
-                "ray-traced global illumination, professional architectural photography, "
-                "hyperrealistic, 8K ultra resolution, Zaha Hadid Architects quality"
-            )
+            full_prompt = style_suffix
         else:
-            full_prompt = (
-                f"award-winning architectural visualization, {prompt}, "
-                "photorealistic CGI render, dramatic cinematic lighting, golden hour atmosphere, "
-                "volumetric light rays, ultra-detailed facade materials, glass curtain wall reflections, "
-                "ambient occlusion, ray-traced global illumination, professional architectural photography, "
-                "hyperrealistic, 8K ultra resolution, sharp focus, "
-                "Zaha Hadid Architects quality render, architectural digest cover shot"
-            )
+            full_prompt = f"{prompt}, {style_suffix}"
 
         token = get_api_token(api_token)
 
@@ -195,24 +188,17 @@ async def run_controlnet_render(
             }
             output_url = await replicate_run(cfg["id"], model_input, token)
         else:
-            # BFL two-step: Redux extracts style from existing render,
-            # then ControlNet applies the mass geometry on top of that style.
-            redux_url = await replicate_run(
-                "black-forest-labs/flux-redux-dev",
-                {"redux_image": open(render_path, "rb"),
-                 "num_inference_steps": 50, "guidance": 3.5},
-                token,
-            )
+            # Primary pipeline: img2img directly on the mass composite.
+            # The mass is already placed in the real photo at the correct position/scale.
+            # flux-dev transforms the flat 3D building surfaces → photorealistic glass
+            # while preserving the surrounding city background (strength < 1.0).
             output_url = await replicate_run(
-                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
-                {"control_image": open(mass_path, "rb"),
-                 "image": redux_url,
+                "black-forest-labs/flux-dev",
+                {"image": open(mass_path, "rb"),
                  "prompt": full_prompt,
-                 "prompt_strength": 0.80,
-                 "controlnet_conditioning_scale": 0.85,
+                 "strength": 0.78,
                  "num_inference_steps": 50,
-                 "guidance_scale": 5.0,
-                 "control_type": "canny"},
+                 "guidance": 5.0},
                 token,
             )
 
@@ -250,21 +236,20 @@ async def run_style_transfer(
         token = get_api_token(api_token)
 
         if model == "flux-redux-controlnet":
-            # Step 1: Redux extracts style/look from the reference image
-            redux_url = await replicate_run(
-                "black-forest-labs/flux-redux-dev",
-                {"redux_image": open(reference_path, "rb"),
-                 "num_inference_steps": 50, "guidance": 3.5},
-                token,
-            )
-
-            # Step 2: ControlNet constrains the redux-styled image to the mass shape
+            # Pass the reference image DIRECTLY as the style image (no Redux preprocessing).
+            # Redux compresses style into an embedding that loses fine material detail
+            # (copper ribs, glass panels, structural specifics). Using the reference
+            # directly gives the ControlNet model richer material information.
             output_url = await replicate_run(
                 "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
-                {"control_image": open(mass_path, "rb"), "image": redux_url,
-                 "prompt": style_prompt, "prompt_strength": 0.80,
-                 "controlnet_conditioning_scale": 0.7, "num_inference_steps": 50,
-                 "guidance_scale": 4.5, "control_type": "canny"},
+                {"control_image": open(mass_path, "rb"),
+                 "image": open(reference_path, "rb"),
+                 "prompt": style_prompt,
+                 "prompt_strength": 0.90,
+                 "controlnet_conditioning_scale": 0.85,
+                 "num_inference_steps": 50,
+                 "guidance_scale": 5.0,
+                 "control_type": "canny"},
                 token,
             )
         elif model == "flux-redux-only":
