@@ -145,8 +145,9 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         raise ValueError(f"No Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
 
     for part in data["candidates"][0]["content"]["parts"]:
-        if "inline_data" in part:
-            img_bytes = base64.b64decode(part["inline_data"]["data"])
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
             out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
             out_path.write_bytes(img_bytes)
             return out_path
