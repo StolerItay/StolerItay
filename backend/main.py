@@ -183,13 +183,39 @@ async def run_controlnet_render(
                 "Zaha Hadid Architects quality render, architectural digest cover shot"
             )
 
-        model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
+        token = get_api_token(api_token)
 
         if model == "sdxl-controlnet":
-            model_input["image"] = open(render_path, "rb")
+            # SDXL: use existing render as img2img base + mass as control
+            model_input = {
+                "image": open(render_path, "rb"),
+                cfg["input_key"]: open(mass_path, "rb"),
+                "prompt": full_prompt,
+                **cfg["extra"],
+            }
+            output_url = await replicate_run(cfg["id"], model_input, token)
+        else:
+            # BFL two-step: Redux extracts style from existing render,
+            # then ControlNet applies the mass geometry on top of that style.
+            redux_url = await replicate_run(
+                "black-forest-labs/flux-redux-dev",
+                {"redux_image": open(render_path, "rb"),
+                 "num_inference_steps": 50, "guidance": 3.5},
+                token,
+            )
+            output_url = await replicate_run(
+                "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
+                {"control_image": open(mass_path, "rb"),
+                 "image": redux_url,
+                 "prompt": full_prompt,
+                 "prompt_strength": 0.85,
+                 "controlnet_conditioning_scale": 0.75,
+                 "num_inference_steps": 50,
+                 "guidance_scale": 4.5,
+                 "control_type": "canny"},
+                token,
+            )
 
-        token = get_api_token(api_token)
-        output_url = await replicate_run(cfg["id"], model_input, token)
         jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
