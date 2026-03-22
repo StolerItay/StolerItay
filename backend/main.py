@@ -120,11 +120,11 @@ async def run_controlnet_render(
             # of the reference render without requiring the user to describe it in text.
             redux_output = await asyncio.to_thread(
                 client.run,
-                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
+                "black-forest-labs/flux-redux-dev",
                 input={
                     "redux_image": open(render_path, "rb"),
                     "num_inference_steps": 50,
-                    "guidance_scale": 4.5,
+                    "guidance": 3.5,
                 },
             )
             redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
@@ -204,9 +204,9 @@ async def run_style_transfer(
             # Step 1: Redux extracts style/look from the reference image
             redux_output = await asyncio.to_thread(
                 client.run,
-                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
-                input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
-                       "num_inference_steps": 50, "guidance_scale": 4.5},
+                "black-forest-labs/flux-redux-dev",
+                input={"redux_image": open(reference_path, "rb"),
+                       "num_inference_steps": 50, "guidance": 3.5},
             )
             redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
 
@@ -222,9 +222,9 @@ async def run_style_transfer(
         elif model == "flux-redux-only":
             output = await asyncio.to_thread(
                 client.run,
-                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
-                input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
-                       "num_inference_steps": 50, "guidance_scale": 4.5},
+                "black-forest-labs/flux-redux-dev",
+                input={"redux_image": open(reference_path, "rb"),
+                       "num_inference_steps": 50, "guidance": 3.5},
             )
         else:  # sdxl-img2img
             output = await asyncio.to_thread(
@@ -275,9 +275,9 @@ async def run_new_angle(
             # Redux always uses the render image as visual style reference regardless of text prompt
             output = await asyncio.to_thread(
                 client.run,
-                "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
-                input={"redux_image": open(render_path, "rb"), "prompt": combined_prompt,
-                       "num_inference_steps": 50, "guidance_scale": 4.5},
+                "black-forest-labs/flux-redux-dev",
+                input={"redux_image": open(render_path, "rb"),
+                       "num_inference_steps": 50, "guidance": 3.5},
             )
         else:  # flux-img2img
             output = await asyncio.to_thread(
