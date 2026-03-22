@@ -1,4 +1,5 @@
 import os
+import sys
 import uuid
 import asyncio
 import base64
@@ -9,9 +10,29 @@ import replicate
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── Path helpers (works both in dev and when frozen by PyInstaller) ──────────
+
+def _base_dir() -> Path:
+    """Directory that holds the exe (frozen) or the script (dev)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def _bundle_dir() -> Path:
+    """Root of the PyInstaller bundle (_MEIPASS) or the script dir in dev."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).parent
+
+
+BASE_DIR = _base_dir()
+BUNDLE_DIR = _bundle_dir()
 
 app = FastAPI(title="ArchRender AI API")
 
@@ -25,12 +46,13 @@ app.add_middleware(
 # In-memory job store (use Redis/DB for production)
 jobs: dict[str, dict] = {}
 
-UPLOADS_DIR = Path("uploads")
-OUTPUTS_DIR = Path("outputs")
+# Runtime dirs live next to the exe so they persist between runs
+UPLOADS_DIR = BASE_DIR / "uploads"
+OUTPUTS_DIR = BASE_DIR / "outputs"
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
 
 
 def save_upload(file: UploadFile) -> Path:
@@ -354,3 +376,36 @@ async def get_job(job_id: str):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "replicate_configured": bool(os.getenv("REPLICATE_API_TOKEN"))}
+
+
+# ── Serve React frontend (must be last) ─────────────────────────────────────
+
+FRONTEND_DIST = BUNDLE_DIR / "frontend_dist"
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        file = FRONTEND_DIST / full_path
+        if file.exists() and file.is_file():
+            return FileResponse(str(file))
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
+
+
+# ── Entry point for PyInstaller ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    import webbrowser
+    import threading
+
+    port = 8000
+
+    def open_browser():
+        import time
+        time.sleep(1.5)
+        webbrowser.open(f"http://localhost:{port}")
+
+    threading.Thread(target=open_browser, daemon=True).start()
+    uvicorn.run(app, host="127.0.0.1", port=port)
