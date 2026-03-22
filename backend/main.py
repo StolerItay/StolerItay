@@ -74,13 +74,13 @@ CONTROLNET_MODELS = {
     "flux-controlnet-canny": {
         "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
-        "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.75,
+        "extra": {"control_type": "canny", "controlnet_conditioning_scale": 0.9,
                    "num_inference_steps": 28, "guidance_scale": 3.5},
     },
     "flux-controlnet-depth": {
         "id": "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
         "input_key": "control_image",
-        "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.75,
+        "extra": {"control_type": "depth", "controlnet_conditioning_scale": 0.9,
                    "num_inference_steps": 28, "guidance_scale": 3.5},
     },
     "sdxl-controlnet": {
@@ -117,10 +117,20 @@ async def run_controlnet_render(
 
         client = get_replicate_client(api_token)
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
+
+        model_input = {cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]}
+
+        # Pass base render as img2img init so the model preserves the scene context
+        # (lighting, environment, materials) while replacing the building mass.
+        # flux-dev-controlnet supports `image` + `prompt_strength` for img2img conditioning.
+        if model in ("flux-controlnet-canny", "flux-controlnet-depth"):
+            model_input["image"] = open(render_path, "rb")
+            model_input["prompt_strength"] = 0.65  # keep 35% of base render
+
         output = await asyncio.to_thread(
             client.run,
             cfg["id"],
-            input={cfg["input_key"]: open(mass_path, "rb"), "prompt": full_prompt, **cfg["extra"]},
+            input=model_input,
         )
 
         output_url = output[0] if isinstance(output, list) else output
@@ -148,18 +158,22 @@ async def run_style_transfer(
 
         client = get_replicate_client(api_token)
         if model == "flux-redux-controlnet":
-            # Two-step: Redux extracts style, ControlNet constrains to mass
-            await asyncio.to_thread(
+            # Step 1: Redux extracts style/look from the reference image
+            redux_output = await asyncio.to_thread(
                 client.run,
                 "black-forest-labs/flux-redux-dev:2a6b1ca2f8ab1f5e9704f62edc88b22afbab43cb2b2bc98e6b0c6e27e87a27c4",
                 input={"redux_image": open(reference_path, "rb"), "prompt": style_prompt,
                        "num_inference_steps": 28, "guidance_scale": 3.5},
             )
+            redux_url = str(redux_output[0] if isinstance(redux_output, list) else redux_output)
+
+            # Step 2: ControlNet constrains the redux-styled image to the mass shape
             output = await asyncio.to_thread(
                 client.run,
                 "xlabs-ai/flux-dev-controlnet:9a8db105db745f8b11ad3afe5c8bd892428b2a43ade0b67edc4e0ccd52ff2fda",
-                input={"control_image": open(mass_path, "rb"), "prompt": style_prompt,
-                       "controlnet_conditioning_scale": 0.7, "num_inference_steps": 28,
+                input={"control_image": open(mass_path, "rb"), "image": redux_url,
+                       "prompt": style_prompt, "prompt_strength": 0.7,
+                       "controlnet_conditioning_scale": 0.9, "num_inference_steps": 28,
                        "guidance_scale": 3.5, "control_type": "canny"},
             )
         elif model == "flux-redux-only":
