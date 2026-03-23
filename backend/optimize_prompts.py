@@ -170,42 +170,63 @@ def _b64(p: Path) -> tuple[str, str]:
     return base64.b64encode(p.read_bytes()).decode(), mime
 
 
-# ── Gemini: generate ──────────────────────────────────────────────────────────
+# ── Server: generate via local backend ────────────────────────────────────────
 
-async def gemini_generate(
+async def server_generate(
     mass: Path,
     render: Path,
-    instruction: str,
-    key: str,
+    tab: str,
+    server: str,
 ) -> Optional[bytes]:
-    """Call Gemini image-gen with the given instruction. Returns PNG bytes or None."""
-    mass_b64, mass_mime = _b64(mass)
-    ref_b64, ref_mime = _b64(render)
-    payload = {
-        "contents": [{"parts": [
-            {"text": instruction},
-            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
-            {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
-        ]}],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
-    }
-    for mid in ["gemini-2.5-flash-image", "gemini-3.1-flash-image-preview"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mid}:generateContent?key={key}"
-        try:
-            async with httpx.AsyncClient(timeout=300) as http:
-                r = await http.post(url, json=payload)
-                print(f"    [{mid}] {r.status_code}", flush=True, end="  ")
-                if r.status_code in (400, 404):
-                    continue
-                r.raise_for_status()
+    """Submit a job to the local backend server and return the output image bytes.
+
+    The server reads prompt_config.json on every request, so prompt changes
+    are picked up automatically without restarting.
+    """
+    endpoint = "update-render" if tab == "update-render" else "style-transfer"
+
+    async with httpx.AsyncClient(timeout=60) as http:
+        # Submit job
+        if tab == "update-render":
+            files = {
+                "render": (render.name, render.read_bytes(), "image/jpeg"),
+                "mass":   (mass.name,   mass.read_bytes(),   "image/png"),
+            }
+        else:
+            files = {
+                "reference": (render.name, render.read_bytes(), "image/jpeg"),
+                "mass":      (mass.name,   mass.read_bytes(),   "image/png"),
+            }
+        r = await http.post(
+            f"{server}/api/{endpoint}",
+            files=files,
+            data={"model": "gemini-direct", "prompt": ""},
+        )
+        r.raise_for_status()
+        job_id = r.json()["jobId"]
+        print(f"    job {job_id[:8]}… submitted", flush=True)
+
+    # Poll until done (max 5 min)
+    for attempt in range(60):
+        await asyncio.sleep(5)
+        async with httpx.AsyncClient(timeout=10) as http:
+            try:
+                r = await http.get(f"{server}/api/job/{job_id}")
                 data = r.json()
-                for part in data["candidates"][0]["content"]["parts"]:
-                    inline = part.get("inlineData") or part.get("inline_data")
-                    if inline:
-                        print("✓ image received", flush=True)
-                        return base64.b64decode(inline["data"])
-        except Exception as exc:
-            print(f"    [{mid}] error: {exc}", flush=True)
+            except Exception:
+                continue
+        status = data.get("status")
+        if status == "done":
+            out_url = server + data["output_url"]
+            async with httpx.AsyncClient(timeout=60) as http:
+                img_r = await http.get(out_url)
+            print(f"    ✓ done after {(attempt+1)*5}s", flush=True)
+            return img_r.content
+        elif status == "error":
+            print(f"    ✗ job error: {data.get('error', '?')}", flush=True)
+            return None
+
+    print("    ✗ job timed out (5 min)", flush=True)
     return None
 
 
@@ -382,7 +403,8 @@ def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
 
 async def run_iteration(
     triplets: list[dict],
-    instruction: str,
+    tab: str,
+    server: str,
     key: str,
     output_dir: Path,
     iteration: int,
@@ -393,7 +415,7 @@ async def run_iteration(
     for triplet in triplets:
         name = triplet["name"]
         print(f"  Generating [{name}] ...", flush=True)
-        img = await gemini_generate(triplet["mass"], triplet["render"], instruction, key)
+        img = await server_generate(triplet["mass"], triplet["render"], tab, server)
         images.append(img)
 
         if img is None:
@@ -451,10 +473,16 @@ async def main_async() -> None:
         help="Directory to save intermediate outputs and scores (default: ./opt_runs/<id>)",
     )
     parser.add_argument(
+        "--server", default="http://localhost:8000",
+        help="Base URL of the running ArchRender backend (default: http://localhost:8000)",
+    )
+    parser.add_argument(
         "--key", default=None,
         help="Gemini API key (default: GEMINI_API_KEY env var)",
     )
     args = parser.parse_args()
+
+    server = args.server.rstrip("/")
 
     key = args.key or os.getenv("GEMINI_API_KEY", "")
     if not key:
@@ -481,13 +509,14 @@ async def main_async() -> None:
         sys.exit(1)
     print(f"Found {len(triplets)} triplet(s): {[t['name'] for t in triplets]}\n")
 
-    # Resolve which prompt key to optimize
+    # Resolve which tab and prompt key to optimize
+    tab = args.tab or "update-render"
     if args.prompt:
         prompt_key = args.prompt
     elif args.tab:
         prompt_key = TAB_DEFAULT_KEY[args.tab]
     else:
-        prompt_key = "direct_render_instruction"
+        prompt_key = TAB_DEFAULT_KEY[tab]
 
     # Load current prompts
     config = load_prompt_config()
@@ -504,7 +533,7 @@ async def main_async() -> None:
     for iteration in range(1, args.iterations + 1):
         print(f"\n── Iteration {iteration}/{args.iterations} {'─' * 44}")
 
-        scores, _ = await run_iteration(triplets, instruction, key, output_dir, iteration)
+        scores, _ = await run_iteration(triplets, tab, server, key, output_dir, iteration)
         valid = [s for s in scores if s]
 
         if not valid:
