@@ -5,10 +5,16 @@ import ModelSelector from './ModelSelector';
 
 const INPAINT_MODELS = [
   {
+    id: 'gemini-edit',
+    name: 'Gemini Edit',
+    tag: 'recommended' as const,
+    note: 'Gemini sees the full render and the painted mask together. Understands architectural context holistically — materials, shadows, perspective — for natural-looking edits. No Replicate token needed.',
+  },
+  {
     id: 'flux-fill-pro',
     name: 'Flux Fill Pro',
-    tag: 'recommended' as const,
-    note: 'State of the art. Seamless blending, photorealistic results.',
+    tag: 'precise' as const,
+    note: 'Pixel-precise mask adherence. Best when the masked boundary must be followed exactly.',
   },
   {
     id: 'flux-fill-dev',
@@ -38,7 +44,7 @@ export default function InpaintCanvas({ imageUrl, onDone, onNewResult }: Props) 
   const [isErasing, setIsErasing] = useState(false);
   const [brushSize, setBrushSize] = useState(30);
   const [prompt, setPrompt] = useState('');
-  const [inpaintModel, setInpaintModel] = useState(INPAINT_MODELS[0].id);
+  const [inpaintModel, setInpaintModel] = useState('gemini-edit');
   const [generating, setGenerating] = useState(false);
   const [dims, setDims] = useState({ w: 800, h: 500 });
   const lastPos = useRef<{ x: number; y: number } | null>(null);

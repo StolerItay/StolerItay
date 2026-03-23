@@ -73,12 +73,24 @@ def mock_gemini(monkeypatch, tmp_path):
         out.write_bytes(_png_bytes_local())
         return out
 
+    async def _fake_gemini_new_angle(render_path, angle_prompt, style_prompt, reference_path=None):
+        out = tmp_path / f"fake_gemini_angle_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
+    async def _fake_gemini_edit_region(base_image_path, base_image_url, mask_data_url, prompt):
+        out = tmp_path / f"fake_gemini_edit_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
     monkeypatch.setattr("main.gemini_generate_render", _fake_gemini_render)
     monkeypatch.setattr("main.gemini_25_render", _fake_gemini_25_render)
     monkeypatch.setattr("main.gemini_describe_style", _fake_gemini_describe)
     monkeypatch.setattr("main.gemini_25_analyze_three_image", _fake_gemini_25_analyze_three)
     monkeypatch.setattr("main.gemini_generate_render_three_image", _fake_gemini_generate_render_three)
     monkeypatch.setattr("main.gemini_25_render_three_image", _fake_gemini_25_render_three)
+    monkeypatch.setattr("main.gemini_new_angle", _fake_gemini_new_angle)
+    monkeypatch.setattr("main.gemini_edit_region", _fake_gemini_edit_region)
 
 
 # Import app after patching
@@ -186,6 +198,28 @@ class TestUpdateRender:
             result = _wait_for_job(r.json()["jobId"])
             assert result["status"] == "done", f"{model} failed: {result}"
 
+    @pytest.mark.parametrize("model", ["gemini-25-pro", "gemini-25-flash", "gemini-direct"])
+    def test_gemini_models_reach_done(self, model):
+        r = client.post(
+            "/api/update-render",
+            files={"render": _png_file(), "mass": _png_file()},
+            data={"model": model},
+        )
+        assert r.status_code == 200
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done", f"{model} failed: {result}"
+
+    @pytest.mark.parametrize("model", ["gemini-25-pro", "gemini-25-flash", "gemini-direct"])
+    def test_gemini_models_return_local_url(self, model):
+        r = client.post(
+            "/api/update-render",
+            files={"render": _png_file(), "mass": _png_file()},
+            data={"model": model},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["output_url"].startswith("/outputs/"), \
+            f"{model} returned unexpected url: {result['output_url']}"
+
 
 # ── /api/style-transfer ──────────────────────────────────────────────────────
 
@@ -282,6 +316,25 @@ class TestNewAngle:
         result = _wait_for_job(job_id)
         assert result["status"] == "done"
 
+    def test_gemini_new_angle_reaches_done(self):
+        r = client.post(
+            "/api/new-angle",
+            files={"render": _png_file()},
+            data={"angle_prompt": "dramatic worm's eye view", "model": "gemini"},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+        assert result["output_url"].startswith("/outputs/")
+
+    def test_gemini_new_angle_with_reference_reaches_done(self):
+        r = client.post(
+            "/api/new-angle",
+            files={"render": _png_file(), "reference": _png_file("ref.png")},
+            data={"angle_prompt": "bird's eye view", "model": "gemini"},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+
 
 # ── /api/inpaint ─────────────────────────────────────────────────────────────
 
@@ -323,6 +376,30 @@ class TestInpaint:
         job_id = r.json()["jobId"]
         result = _wait_for_job(job_id)
         assert result["status"] == "done"
+
+    def test_gemini_edit_with_uploaded_image_reaches_done(self):
+        r = client.post(
+            "/api/inpaint",
+            files={"base_image": _png_file()},
+            data={"mask_data_url": _data_uri_mask(), "prompt": "add terrace greenery", "model": "gemini-edit"},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+        assert result["output_url"].startswith("/outputs/")
+
+    def test_gemini_edit_with_url_image_reaches_done(self):
+        r = client.post(
+            "/api/inpaint",
+            data={
+                "base_image_url": FAKE_OUTPUT_URL,
+                "mask_data_url": _data_uri_mask(),
+                "prompt": "replace facade with dark glass",
+                "model": "gemini-edit",
+            },
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+        assert result["output_url"].startswith("/outputs/")
 
 
 # ── /api/style-transfer (three-image delta workflow) ─────────────────────────

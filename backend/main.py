@@ -395,6 +395,194 @@ async def gemini_25_render_three_image(
     return await gemini_generate_render(modified_mass_path, reference_path, rich_prompt)
 
 
+async def gemini_new_angle(
+    render_path: Path,
+    angle_prompt: str,
+    style_prompt: str,
+    reference_path: Optional[Path] = None,
+) -> Path:
+    """
+    Generate a new camera angle of the same building using Gemini image generation.
+
+    Follows the same model-fallback chain and inline_data pattern as gemini_generate_render.
+    When a reference image is provided it is included as a second image so the model can
+    match the desired composition angle directly from pixels rather than from text alone.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    render_b64, render_mime = _b64(render_path)
+
+    angle_part = angle_prompt.strip() if angle_prompt.strip() else "a compelling new viewpoint"
+    style_part = (
+        style_prompt.strip() if style_prompt.strip()
+        else "matching the exact facade materials, lighting and atmosphere of the source render"
+    )
+
+    if reference_path:
+        ref_b64, ref_mime = _b64(reference_path)
+        instruction = (
+            "You are an expert architectural visualization artist. "
+            "Image 1 is a photorealistic architectural render of a building. "
+            "Image 2 shows a reference for the desired camera angle and composition. "
+            f"Generate a photorealistic render of the exact same building from: {angle_part}. "
+            "Match the camera composition shown in Image 2. "
+            "Preserve every facade material, glass type, structural element, and architectural detail "
+            f"from Image 1 exactly. {style_part}. "
+            "Output only the rendered image, no text."
+        )
+        parts = [
+            {"text": instruction},
+            {"inline_data": {"mime_type": render_mime, "data": render_b64}},
+            {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+        ]
+    else:
+        instruction = (
+            "You are an expert architectural visualization artist. "
+            "The image shows a photorealistic architectural render of a building. "
+            f"Generate a photorealistic render of the exact same building from: {angle_part}. "
+            "Preserve every facade material, glass type, structural element, and architectural detail exactly. "
+            f"{style_part}. "
+            "Output only the rendered image, no text."
+        )
+        parts = [
+            {"text": instruction},
+            {"inline_data": {"mime_type": render_mime, "data": render_b64}},
+        ]
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini new-angle] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"No Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+            out_path.write_bytes(img_bytes)
+            return out_path
+
+    raise ValueError(f"Gemini returned no image. Response: {data}")
+
+
+async def gemini_edit_region(
+    base_image_path: Optional[Path],
+    base_image_url: Optional[str],
+    mask_data_url: str,
+    prompt: str,
+) -> Path:
+    """
+    Gemini-based region editing (inpainting alternative).
+
+    Sends the base render + the painted mask as two images. The model sees
+    exactly which pixels to change (white = edit here) and blends the result
+    into the surrounding context. Less pixel-precise than Flux Fill on hard
+    mask edges, but understands architectural context holistically.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    # Resolve base image to b64
+    if base_image_path and base_image_path.exists():
+        suffix = base_image_path.suffix.lower().lstrip(".")
+        base_mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        base_b64 = base64.b64encode(base_image_path.read_bytes()).decode()
+    elif base_image_url:
+        async with httpx.AsyncClient(timeout=30) as http:
+            r = await http.get(base_image_url)
+            r.raise_for_status()
+            raw = r.content
+        base_mime = "image/png" if raw[:4] == b"\x89PNG" else "image/jpeg"
+        base_b64 = base64.b64encode(raw).decode()
+    else:
+        raise ValueError("No base image provided for Gemini edit")
+
+    # Mask is a data URI
+    mask_bytes = base64.b64decode(mask_data_url.split(",", 1)[1])
+    mask_b64 = base64.b64encode(mask_bytes).decode()
+
+    instruction = (
+        "You are an expert architectural visualization artist. "
+        "Image 1 is a photorealistic architectural render. "
+        "Image 2 is an edit mask where white pixels mark the region to change. "
+        f"Edit only the white-masked region: {prompt.strip()}. "
+        "The result must blend seamlessly into the untouched surroundings — "
+        "match perspective, lighting, shadow, scale, and material quality exactly. "
+        "Output only the edited image, no text."
+    )
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": base_mime, "data": base_b64}},
+                {"inline_data": {"mime_type": "image/png", "data": mask_b64}},
+            ]
+        }],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini edit-region] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"No Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+            out_path.write_bytes(img_bytes)
+            return out_path
+
+    raise ValueError(f"Gemini returned no image. Response: {data}")
+
+
 async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str:
     """Use Gemini Vision (REST API) to extract a precise architectural style prompt from an image."""
     key = get_gemini_key()
@@ -515,13 +703,33 @@ async def run_controlnet_render(
     job_id: str,
     api_token: Optional[str] = None,
 ) -> None:
-    """Structure-guided render using official BFL canny/depth-pro models."""
+    """Structure-guided render using official BFL canny/depth-pro models or Gemini.
+
+    For Gemini models the existing render acts as the style reference and the new
+    mass provides the geometry — exactly the same roles as in the style-transfer tab
+    but surfaced here for users who already have a render they want to update.
+    """
     try:
         jobs[job_id]["status"] = "processing"
 
+        # ── Gemini routes ────────────────────────────────────────────────────
+        if model == "gemini-25-pro":
+            out_path = await gemini_25_render(mass_path, render_path, prompt, analyzer_model="gemini-2.5-pro")
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+        elif model == "gemini-25-flash":
+            out_path = await gemini_25_render(mass_path, render_path, prompt, analyzer_model="gemini-2.5-flash")
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+        elif model == "gemini-direct":
+            out_path = await gemini_generate_render(mass_path, render_path, prompt)
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+
+        # ── Flux / SDXL routes ───────────────────────────────────────────────
         cfg = CONTROLNET_MODELS.get(model, CONTROLNET_MODELS["flux-controlnet-canny"])
 
-        # Gemini analyzes the existing render → extracts scene lighting, atmosphere, materials.
+        # Gemini Flash extracts scene lighting, atmosphere, materials from the existing render.
         full_prompt = await gemini_describe_style(render_path, prompt)
 
         token = get_api_token(api_token)
@@ -654,6 +862,13 @@ async def run_new_angle(
     try:
         jobs[job_id]["status"] = "processing"
 
+        # ── Gemini route ─────────────────────────────────────────────────────
+        if model == "gemini":
+            out_path = await gemini_new_angle(render_path, angle_prompt, style_prompt, reference_path)
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+
+        # ── Flux routes ───────────────────────────────────────────────────────
         style_part = style_prompt.strip() if style_prompt.strip() else "matching the exact materials, lighting and atmosphere of the original render"
         combined_prompt = (
             f"award-winning architectural visualization of the exact same building, {angle_prompt}, "
@@ -704,6 +919,13 @@ async def run_inpaint(
     try:
         jobs[job_id]["status"] = "processing"
 
+        # ── Gemini route ─────────────────────────────────────────────────────
+        if inpaint_model == "gemini-edit":
+            out_path = await gemini_edit_region(base_image_path, base_image_url, mask_data_url, prompt)
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+
+        # ── Flux / SD routes ──────────────────────────────────────────────────
         full_prompt = (
             f"award-winning architectural detail, {prompt}, "
             "seamlessly integrated, perfectly matching surrounding materials and lighting, "

@@ -16,10 +16,16 @@ const ANGLE_PRESETS = [
 
 const MODELS = [
   {
+    id: 'gemini',
+    name: 'Gemini Image Gen',
+    tag: 'recommended' as const,
+    note: 'Gemini sees the source render directly and generates the new angle. Understands building identity, materials, and spatial context — no style information is lost to text conversion.',
+  },
+  {
     id: 'zero123plus',
     name: 'Flux Canny Pro (BFL)',
-    tag: 'recommended' as const,
-    note: 'Best quality. Uses the source render as a structural guide via edge detection.',
+    tag: 'precise' as const,
+    note: 'Uses the source render as a structural guide via edge detection. Very precise on silhouette.',
   },
   {
     id: 'flux-redux',
@@ -40,7 +46,7 @@ export default function NewAngleTab() {
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [anglePrompt, setAnglePrompt] = useState('');
   const [stylePrompt, setStylePrompt] = useState('');
-  const [model, setModel] = useState(MODELS[0].id);
+  const [model, setModel] = useState('gemini');
   const [jobId, setJobId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 

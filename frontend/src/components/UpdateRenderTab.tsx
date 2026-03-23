@@ -8,15 +8,33 @@ import { submitUpdateRender } from '../api';
 
 const MODELS = [
   {
+    id: 'gemini-25-pro',
+    name: 'Gemini 2.5 Pro → Image Gen',
+    tag: 'recommended' as const,
+    note: 'Two-step: Gemini 2.5 Pro reads both the existing render (style) and the new mass (geometry), writes a rich architectural prompt, then generates the render. Sees full visual context — best quality.',
+  },
+  {
+    id: 'gemini-25-flash',
+    name: 'Gemini 2.5 Flash → Image Gen',
+    tag: 'fast' as const,
+    note: 'Same two-step pipeline with Flash. Faster than Pro. Gemini reads both images directly — no information lost to text conversion.',
+  },
+  {
+    id: 'gemini-direct',
+    name: 'Gemini Direct (one-shot)',
+    tag: 'fast' as const,
+    note: 'Gemini sees both images in one shot and generates the render immediately. No separate analysis step.',
+  },
+  {
     id: 'flux-controlnet-canny',
     name: 'Flux Canny Pro (BFL)',
-    tag: 'recommended' as const,
-    note: 'Best quality. Official Black Forest Labs model — edge-guided generation at highest fidelity.',
+    tag: 'precise' as const,
+    note: 'Official Black Forest Labs edge-guided model. Very precise on silhouette and line work.',
   },
   {
     id: 'flux-controlnet-depth',
     name: 'Flux Depth Pro (BFL)',
-    tag: 'fast' as const,
+    tag: 'precise' as const,
     note: 'Best for masses with strong 3D depth variation. Official BFL depth-guided model.',
   },
   {
