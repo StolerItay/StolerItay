@@ -1,7 +1,7 @@
 interface Model {
   id: string;
   name: string;
-  tag?: 'recommended' | 'fast' | 'fallback';
+  tag?: 'recommended' | 'fast' | 'fallback' | 'precise';
   note: string;
 }
 
@@ -15,6 +15,7 @@ const TAG_STYLES: Record<string, string> = {
   recommended: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/40',
   fast: 'bg-blue-500/20 text-blue-400 border-blue-500/40',
   fallback: 'bg-gray-700/40 text-gray-500 border-gray-600/40',
+  precise: 'bg-purple-500/20 text-purple-400 border-purple-500/40',
 };
 
 export default function ModelSelector({ models, value, onChange }: Props) {
