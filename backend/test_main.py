@@ -524,3 +524,131 @@ class TestHelpers:
     def test_get_api_token_uses_param(self):
         from main import get_api_token
         assert get_api_token("r8_custom_token") == "r8_custom_token"
+
+
+# ── /api/library ──────────────────────────────────────────────────────────────
+
+class TestLibrary:
+    """Photo library upload, list, run-tests, and results endpoints."""
+
+    def test_upload_mass_image(self):
+        r = client.post(
+            "/api/library/upload",
+            files={"file": _png_file("mass.png")},
+            data={"role": "mass"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["role"] == "mass"
+        assert body["id"].endswith(".png")
+        assert body["url"].startswith("/library/mass/")
+
+    def test_upload_render_image(self):
+        r = client.post(
+            "/api/library/upload",
+            files={"file": _png_file("render.png")},
+            data={"role": "render"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["role"] == "render"
+        assert body["url"].startswith("/library/render/")
+
+    def test_upload_invalid_role_returns_422(self):
+        r = client.post(
+            "/api/library/upload",
+            files={"file": _png_file("bad.png")},
+            data={"role": "unknown"},
+        )
+        assert r.status_code == 422
+
+    def test_list_returns_grouped_images(self):
+        # Upload one of each
+        client.post("/api/library/upload",
+                    files={"file": _png_file("m.png")}, data={"role": "mass"})
+        client.post("/api/library/upload",
+                    files={"file": _png_file("r.png")}, data={"role": "render"})
+        r = client.get("/api/library")
+        assert r.status_code == 200
+        body = r.json()
+        assert "mass" in body and "render" in body
+        assert len(body["mass"]) >= 1
+        assert len(body["render"]) >= 1
+
+    def test_run_tests_with_empty_library_returns_422(self, tmp_path, monkeypatch):
+        # Point dirs at empty tmp folders so previous uploads don't bleed in
+        import main as m
+        monkeypatch.setattr(m, "LIBRARY_MASS_DIR", tmp_path / "mass")
+        monkeypatch.setattr(m, "LIBRARY_RENDER_DIR", tmp_path / "render")
+        (tmp_path / "mass").mkdir()
+        (tmp_path / "render").mkdir()
+        r = client.post("/api/library/run-tests")
+        assert r.status_code == 422
+
+    def test_run_tests_returns_run_id(self, tmp_path, monkeypatch):
+        import main as m
+        mass_dir = tmp_path / "mass"
+        render_dir = tmp_path / "render"
+        results_dir = tmp_path / "results"
+        mass_dir.mkdir(); render_dir.mkdir(); results_dir.mkdir()
+        (mass_dir / "m.png").write_bytes(_png_bytes())
+        (render_dir / "r.png").write_bytes(_png_bytes())
+        monkeypatch.setattr(m, "LIBRARY_MASS_DIR", mass_dir)
+        monkeypatch.setattr(m, "LIBRARY_RENDER_DIR", render_dir)
+        monkeypatch.setattr(m, "TEST_RESULTS_DIR", results_dir)
+        r = client.post("/api/library/run-tests")
+        assert r.status_code == 200
+        body = r.json()
+        assert "run_id" in body
+        assert body["job_count"] == 6  # 1 pair × 2 tabs × 3 models
+        assert body["pairs"] == 1
+
+    def test_test_results_list_returns_runs(self, tmp_path, monkeypatch):
+        import json as _json
+        import main as m
+        results_dir = tmp_path / "results"
+        results_dir.mkdir()
+        # Plant a fake result file
+        fake_run = {
+            "run_id": "fake-run-001",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "entries": [
+                {"job_id": "j1", "tab": "style-transfer", "model": "gemini-25-pro",
+                 "status": "done", "output_url": "/outputs/x.png",
+                 "mass": "m.png", "render": "r.png", "error": None},
+            ],
+        }
+        (results_dir / "fake-run-001.json").write_text(_json.dumps(fake_run))
+        monkeypatch.setattr(m, "TEST_RESULTS_DIR", results_dir)
+        r = client.get("/api/library/test-results")
+        assert r.status_code == 200
+        runs = r.json()["runs"]
+        assert any(run["run_id"] == "fake-run-001" for run in runs)
+
+    def test_test_results_detail_returns_entries(self, tmp_path, monkeypatch):
+        import json as _json
+        import main as m
+        results_dir = tmp_path / "results2"
+        results_dir.mkdir()
+        fake_run = {
+            "run_id": "fake-run-002",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "entries": [
+                {"job_id": "j2", "tab": "update-render", "model": "gemini-direct",
+                 "status": "done", "output_url": "/outputs/y.png",
+                 "mass": "m.png", "render": "r.png", "error": None},
+            ],
+        }
+        (results_dir / "fake-run-002.json").write_text(_json.dumps(fake_run))
+        monkeypatch.setattr(m, "TEST_RESULTS_DIR", results_dir)
+        r = client.get("/api/library/test-results/fake-run-002")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["run_id"] == "fake-run-002"
+        assert len(data["entries"]) == 1
+
+    def test_test_results_detail_404_for_unknown_run(self, tmp_path, monkeypatch):
+        import main as m
+        monkeypatch.setattr(m, "TEST_RESULTS_DIR", tmp_path)
+        r = client.get("/api/library/test-results/does-not-exist")
+        assert r.status_code == 404

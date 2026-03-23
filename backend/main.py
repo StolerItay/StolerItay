@@ -8,8 +8,10 @@ if sys.version_info < (3, 11):
 
 import os
 import uuid
+import json
 import asyncio
 import base64
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -56,10 +58,17 @@ jobs: dict[str, dict] = {}
 # Runtime dirs live next to the exe so they persist between runs
 UPLOADS_DIR = BASE_DIR / "uploads"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-UPLOADS_DIR.mkdir(exist_ok=True)
-OUTPUTS_DIR.mkdir(exist_ok=True)
+LIBRARY_MASS_DIR = BASE_DIR / "library" / "mass"
+LIBRARY_RENDER_DIR = BASE_DIR / "library" / "render"
+TEST_RESULTS_DIR = BASE_DIR / "test_results"
+
+for _d in (UPLOADS_DIR, OUTPUTS_DIR, LIBRARY_MASS_DIR, LIBRARY_RENDER_DIR, TEST_RESULTS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
+app.mount("/library/mass", StaticFiles(directory=str(LIBRARY_MASS_DIR)), name="library_mass")
+app.mount("/library/render", StaticFiles(directory=str(LIBRARY_RENDER_DIR)), name="library_render")
+app.mount("/test_results", StaticFiles(directory=str(TEST_RESULTS_DIR)), name="test_results")
 
 
 def save_upload(file: UploadFile) -> Path:
@@ -1081,6 +1090,189 @@ async def validate_token(token: str = Form(...)):
         return {"valid": False, "error": "Invalid token"}
     except Exception as e:
         return {"valid": False, "error": str(e)}
+
+
+# ── Photo library ────────────────────────────────────────────────────────────
+
+LIBRARY_GEMINI_MODELS = ["gemini-25-pro", "gemini-25-flash", "gemini-direct"]
+LIBRARY_TABS = ["style-transfer", "update-render"]
+
+_ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _library_image_info(path: Path, role: str) -> dict:
+    return {
+        "id": path.name,
+        "name": path.stem,
+        "role": role,
+        "url": f"/library/{role}/{path.name}",
+    }
+
+
+def _load_run_result(run_file: Path) -> dict:
+    try:
+        return json.loads(run_file.read_text())
+    except Exception:
+        return {}
+
+
+def _save_run_result(run_id: str, entries: list[dict]) -> Path:
+    data = {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "entries": entries,
+    }
+    out = TEST_RESULTS_DIR / f"{run_id}.json"
+    out.write_text(json.dumps(data, indent=2))
+    return out
+
+
+@app.post("/api/library/upload")
+async def library_upload(
+    file: UploadFile = File(...),
+    role: str = Form(...),
+):
+    """Upload an image to the photo library. role must be 'mass' or 'render'."""
+    if role not in ("mass", "render"):
+        raise HTTPException(status_code=422, detail="role must be 'mass' or 'render'")
+    suffix = Path(file.filename or "file.png").suffix.lower()
+    if suffix not in _ALLOWED_IMAGE_SUFFIXES:
+        raise HTTPException(status_code=422, detail=f"Unsupported image type: {suffix}")
+    dest_dir = LIBRARY_MASS_DIR if role == "mass" else LIBRARY_RENDER_DIR
+    dest = dest_dir / f"{uuid.uuid4()}{suffix}"
+    dest.write_bytes(await file.read())
+    return _library_image_info(dest, role)
+
+
+@app.get("/api/library")
+async def library_list():
+    """List all images in the library, grouped by role."""
+    masses = [_library_image_info(p, "mass") for p in sorted(LIBRARY_MASS_DIR.iterdir())
+              if p.suffix.lower() in _ALLOWED_IMAGE_SUFFIXES]
+    renders = [_library_image_info(p, "render") for p in sorted(LIBRARY_RENDER_DIR.iterdir())
+               if p.suffix.lower() in _ALLOWED_IMAGE_SUFFIXES]
+    return {"mass": masses, "render": renders, "total": len(masses) + len(renders)}
+
+
+async def run_library_test_suite(
+    mass_paths: list[Path],
+    render_paths: list[Path],
+    run_id: str,
+) -> None:
+    """
+    For every mass+render pair: run Style Transfer and Update Render with every
+    Gemini model. Results are stored in test_results/{run_id}.json.
+    """
+    entries: list[dict] = []
+    tasks: list[asyncio.Task] = []
+
+    for mass_path in mass_paths:
+        for render_path in render_paths:
+            for tab in LIBRARY_TABS:
+                for model in LIBRARY_GEMINI_MODELS:
+                    job_id = str(uuid.uuid4())
+                    jobs[job_id] = {"status": "pending"}
+                    entry: dict = {
+                        "run_id": run_id,
+                        "job_id": job_id,
+                        "tab": tab,
+                        "model": model,
+                        "mass": mass_path.name,
+                        "render": render_path.name,
+                        "status": "pending",
+                        "output_url": None,
+                        "error": None,
+                    }
+                    entries.append(entry)
+
+                    if tab == "style-transfer":
+                        coro = run_style_transfer(mass_path, render_path, "", model, job_id)
+                    else:  # update-render
+                        coro = run_controlnet_render(render_path, mass_path, "", model, job_id)
+
+                    tasks.append(asyncio.create_task(coro))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Reflect final job state back into entries
+    for i, entry in enumerate(entries):
+        job = jobs.get(entry["job_id"], {})
+        entry["status"] = job.get("status", "error")
+        entry["output_url"] = job.get("output_url")
+        exc = results[i]
+        if isinstance(exc, Exception):
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+
+    _save_run_result(run_id, entries)
+
+
+@app.post("/api/library/run-tests")
+async def library_run_tests(background_tasks=None):
+    """
+    Kick off a full test run against every mass+render pair in the library.
+    All 3 Gemini models × Style Transfer + Update Render = 6 jobs per pair.
+    Returns the run_id immediately; results appear in GET /api/library/test-results/{run_id}.
+    """
+    mass_paths = sorted(p for p in LIBRARY_MASS_DIR.iterdir()
+                        if p.suffix.lower() in _ALLOWED_IMAGE_SUFFIXES)
+    render_paths = sorted(p for p in LIBRARY_RENDER_DIR.iterdir()
+                          if p.suffix.lower() in _ALLOWED_IMAGE_SUFFIXES)
+    if not mass_paths:
+        raise HTTPException(status_code=422, detail="No mass images in library. Upload at least one.")
+    if not render_paths:
+        raise HTTPException(status_code=422, detail="No render images in library. Upload at least one.")
+
+    run_id = str(uuid.uuid4())
+    job_count = len(mass_paths) * len(render_paths) * len(LIBRARY_TABS) * len(LIBRARY_GEMINI_MODELS)
+
+    asyncio.create_task(run_library_test_suite(mass_paths, render_paths, run_id))
+
+    return {
+        "run_id": run_id,
+        "job_count": job_count,
+        "pairs": len(mass_paths) * len(render_paths),
+        "results_url": f"/api/library/test-results/{run_id}",
+    }
+
+
+@app.get("/api/library/test-results")
+async def library_test_results_list():
+    """List all saved test run summaries (newest first)."""
+    runs = []
+    for f in sorted(TEST_RESULTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        data = _load_run_result(f)
+        if data:
+            entries = data.get("entries", [])
+            done = sum(1 for e in entries if e.get("status") == "done")
+            runs.append({
+                "run_id": data.get("run_id"),
+                "timestamp": data.get("timestamp"),
+                "total": len(entries),
+                "done": done,
+                "errors": sum(1 for e in entries if e.get("status") == "error"),
+                "pending": len(entries) - done - sum(1 for e in entries if e.get("status") == "error"),
+            })
+    return {"runs": runs}
+
+
+@app.get("/api/library/test-results/{run_id}")
+async def library_test_results_detail(run_id: str):
+    """Full detail for a single test run including all input/output URLs."""
+    result_file = TEST_RESULTS_DIR / f"{run_id}.json"
+    if not result_file.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    data = _load_run_result(result_file)
+    # Refresh status for still-running jobs
+    for entry in data.get("entries", []):
+        if entry.get("status") in ("pending", "processing"):
+            job = jobs.get(entry["job_id"], {})
+            entry["status"] = job.get("status", entry["status"])
+            entry["output_url"] = job.get("output_url", entry.get("output_url"))
+            if entry["status"] in ("done", "error"):
+                # Persist the update
+                _save_run_result(run_id, data["entries"])
+    return data
 
 
 # ── Serve React frontend (must be last) ─────────────────────────────────────
