@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""
+optimize_prompts.py — Prompt Optimization Agent for ArchRender AI
+==================================================================
+
+Uses a textual gradient descent loop to iteratively improve the Gemini
+instruction prompts by testing against expected results.
+
+Workflow (per iteration):
+  1. Generate outputs using current prompts (calls Gemini API directly)
+  2. Gemini judges each output vs the expected --result image
+     → scores geometry fidelity, height preservation, style quality
+  3. Aggregate failures into a feedback summary ("textual gradient")
+  4. Gemini rewrites the prompts to address the failures
+  5. Save the best-scoring prompts to prompt_config.json
+  6. main.py re-reads prompt_config.json on every request (hot-reload)
+
+Folder layout expected:
+  parent_folder/
+    200A/
+      200--mass.png
+      200--render.jpg
+      200--result.jpg   ← expected / desired photorealistic output
+    200B/
+      ...
+
+Usage:
+  python optimize_prompts.py --folder ./Tests/replace_in_a_render
+  python optimize_prompts.py --folder ./tests --iterations 5
+  python optimize_prompts.py --folder ./tests --iterations 3 --output-dir ./runs
+  python optimize_prompts.py --folder ./tests --prompt direct_render_instruction
+"""
+
+import argparse
+import asyncio
+import base64
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Optional
+
+try:
+    import httpx
+except ImportError:
+    print("httpx not installed. Run: pip install httpx", file=sys.stderr)
+    sys.exit(1)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+PROMPT_CONFIG_PATH = BASE_DIR / "prompt_config.json"
+ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+# ── Prompt keys and defaults ──────────────────────────────────────────────────
+# These mirror the defaults embedded in main.py so the optimizer starts from
+# the current best-known baseline.
+
+DEFAULTS: dict[str, str] = {
+    "update_render_direct_instruction": (
+        "You are an expert architectural visualization artist. "
+        "Image 1 is a new architectural mass/volume model — the EXACT geometric blueprint for a new building. "
+        "Image 2 is an existing photorealistic render of a site whose building will be replaced.\n\n"
+        "CRITICAL — TASK: Replace the building in Image 2 with the new building defined by Image 1. "
+        "The result must look like the new building was ALWAYS PART OF THE SCENE in Image 2.\n\n"
+        "GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
+        "- SILHOUETTE: Reproduce the EXACT outer silhouette of Image 1 — do not alter height, width, or outline.\n"
+        "- HEIGHT: Tower height is a fixed constraint. Do NOT compress, elongate, or rescale vertically.\n"
+        "- PROPORTIONS: Width-to-height ratio must match Image 1 exactly.\n"
+        "- Preserve every feature: crown shape, podium, setbacks, connecting elements, lattice structures.\n"
+        "- Do NOT simplify, redesign, or 'improve' any aspect of the geometry from Image 1.\n\n"
+        "SCENE INTEGRATION (from Image 2):\n"
+        "- Match the camera angle, perspective, and focal length of Image 2 EXACTLY.\n"
+        "- Preserve ALL surrounding elements unchanged: sky, roads, vegetation, other buildings, infrastructure.\n"
+        "- Match the lighting direction, quality, and color temperature of Image 2.\n"
+        "- The new building must cast shadows consistent with Image 2's sun angle and atmosphere.\n"
+        "- Adapt facade materials to look photorealistic within Image 2's environmental context.\n"
+        "Output only the rendered image, no text."
+    ),
+    "direct_render_instruction": (
+        "You are an expert architectural visualization artist. "
+        "The first image is an architectural mass/volume model — treat it as a strict geometric blueprint. "
+        "The second image is a reference architectural render showing the desired materials and style. "
+        "\n\nCRITICAL — GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
+        "- SILHOUETTE: The outer silhouette of the building must be PIXEL-IDENTICAL to Image 1. "
+        "Do not alter the boundary, outline, or overall form in any way.\n"
+        "- HEIGHT: The height of each tower is a fixed constraint. Do NOT compress, elongate, or "
+        "rescale any building vertically. Tower heights and their ratios must be preserved exactly.\n"
+        "- PROPORTIONS: Each tower's width-to-height ratio must match Image 1 exactly. "
+        "Do not make towers wider, narrower, taller, or shorter than shown.\n"
+        "- Reproduce the EXACT number of towers and their relative positions.\n"
+        "- Preserve the precise crown/top profile of every tower (shape, slant, cutouts, fins).\n"
+        "- Keep every connecting element: sky bridges, structural links, transitions between towers.\n"
+        "- Maintain the base/podium form: its footprint, curved elements, canopy, or lattice structure.\n"
+        "- Do NOT simplify, merge, add, smooth, or omit any architectural feature shown in the mass.\n"
+        "- This is a STYLE TRANSFER only — you are changing materials and lighting, NOT redesigning the building.\n"
+        "\nSTYLE (from Image 2 only): apply the facade materials, glass type and color, structural "
+        "finish, lighting, sky, vegetation, and overall atmosphere.\n"
+        "Output only the rendered image, no text."
+    ),
+    "analyzer_instruction": (
+        "You are a senior architectural visualization director. "
+        "Analyze both images carefully:\n"
+        "- Image 1: an architectural mass/volume model — the EXACT geometric blueprint.\n"
+        "- Image 2: a reference architectural render showing the target style only.\n\n"
+        "Write a detailed image generation prompt (300-500 words) that will guide an AI image model "
+        "to render Image 1's geometry in the exact style of Image 2.\n\n"
+        "SECTION 1 — GEOMETRY (from Image 1, must be described with full precision):\n"
+        "- Exact number of towers and their relative heights. Express each tower's height as a "
+        "fraction of the tallest tower (e.g. 'main tower full height, secondary tower 60% as tall').\n"
+        "- CRITICAL: describe the exact outer silhouette of the entire composition — this is the "
+        "single most important constraint; the generated image must match it exactly.\n"
+        "- Crown/top profile of each tower: describe the exact shape, any cutouts, fins, tapers, or distinctive terminations.\n"
+        "- All connecting elements: sky bridges, structural links, podium transitions between towers — describe location and form.\n"
+        "- Base/podium structure: footprint, curved or lattice elements, canopy, entrance volumes.\n"
+        "- Any other distinctive geometric features (setbacks, chamfers, openings).\n"
+        "IMPORTANT: the prompt you write must explicitly instruct the image model that:\n"
+        "1. The outer silhouette and every tower's height must be IDENTICAL to Image 1 — "
+        "do not alter height, width, or outline under any circumstances.\n"
+        "2. This is a STYLE TRANSFER only — change materials and lighting, NOT the building geometry.\n"
+        "3. It must NOT compress, elongate, widen, narrow, simplify, merge, add, or omit any feature.\n\n"
+        "SECTION 2 — STYLE (from Image 2 only):\n"
+        "- Facade materials, textures, colors, glass type.\n"
+        "- Structural and architectural surface details.\n"
+        "- Lighting conditions, time of day, shadows.\n"
+        "- Sky, weather, atmosphere.\n"
+        "- Surrounding context, ground, vegetation.\n"
+        "- Camera angle and framing.\n\n"
+        "Output only the prompt text, no preamble."
+    ),
+}
+
+OPTIMIZABLE_KEYS = list(DEFAULTS.keys())
+
+# Maps --tab argument to the primary prompt key for that tab
+TAB_DEFAULT_KEY = {
+    "style-transfer": "direct_render_instruction",
+    "update-render": "update_render_direct_instruction",
+}
+
+# ── Prompt config I/O ─────────────────────────────────────────────────────────
+
+def load_prompt_config() -> dict:
+    if PROMPT_CONFIG_PATH.exists():
+        return json.loads(PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_prompt_config(config: dict) -> None:
+    PROMPT_CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  → Saved prompts to {PROMPT_CONFIG_PATH}")
+
+
+def get_instruction(config: dict, key: str) -> str:
+    return config.get(key) or DEFAULTS.get(key, "")
+
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
+
+def _b64(p: Path) -> tuple[str, str]:
+    suffix = p.suffix.lower().lstrip(".")
+    mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+    return base64.b64encode(p.read_bytes()).decode(), mime
+
+
+# ── Gemini: generate ──────────────────────────────────────────────────────────
+
+async def gemini_generate(
+    mass: Path,
+    render: Path,
+    instruction: str,
+    key: str,
+) -> Optional[bytes]:
+    """Call Gemini image-gen with the given instruction. Returns PNG bytes or None."""
+    mass_b64, mass_mime = _b64(mass)
+    ref_b64, ref_mime = _b64(render)
+    payload = {
+        "contents": [{"parts": [
+            {"text": instruction},
+            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+            {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+    for mid in ["gemini-2.5-flash-image", "gemini-3.1-flash-image-preview"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mid}:generateContent?key={key}"
+        try:
+            async with httpx.AsyncClient(timeout=300) as http:
+                r = await http.post(url, json=payload)
+                print(f"    [{mid}] {r.status_code}", flush=True, end="  ")
+                if r.status_code in (400, 404):
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                for part in data["candidates"][0]["content"]["parts"]:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline:
+                        print("✓ image received", flush=True)
+                        return base64.b64decode(inline["data"])
+        except Exception as exc:
+            print(f"    [{mid}] error: {exc}", flush=True)
+    return None
+
+
+# ── Gemini: judge ─────────────────────────────────────────────────────────────
+
+async def gemini_judge(
+    mass: Path,
+    expected: Path,
+    generated: bytes,
+    key: str,
+) -> dict:
+    """Score generated output vs expected result."""
+    mass_b64, mass_mime = _b64(mass)
+    exp_b64, exp_mime = _b64(expected)
+    gen_b64 = base64.b64encode(generated).decode()
+
+    judge_prompt = (
+        "You are evaluating an AI-generated architectural visualization.\n"
+        "Three images are provided:\n"
+        "- Image 1: architectural mass/wireframe model (exact geometric blueprint)\n"
+        "- Image 2: expected photorealistic result (ground truth target)\n"
+        "- Image 3: AI-generated output to evaluate\n\n"
+        "Score Image 3 on each criterion (integer 0-10):\n"
+        "  geometry_fidelity   — Does Image 3 match Image 1's silhouette, tower count, and proportions?\n"
+        "  height_preservation — Are each tower's heights preserved exactly from Image 1?\n"
+        "  style_quality       — Does Image 3 match Image 2's materials, lighting, atmosphere?\n"
+        "  overall_quality     — Overall photorealism and architectural quality.\n\n"
+        "Also provide:\n"
+        "  issues        — top 3 specific problems (geometry errors, height changes, missing elements)\n"
+        "  geometry_delta — describe exactly how Image 3's geometry differs from Image 1\n\n"
+        "Return ONLY valid JSON (no markdown, no extra text):\n"
+        '{"geometry_fidelity":0,"height_preservation":0,"style_quality":0,"overall_quality":0,'
+        '"issues":["","",""],"geometry_delta":""}'
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": judge_prompt},
+            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+            {"inline_data": {"mime_type": exp_mime, "data": exp_b64}},
+            {"inline_data": {"mime_type": "image/png", "data": gen_b64}},
+        ]}],
+    }
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={key}"
+    )
+    async with httpx.AsyncClient(timeout=120) as http:
+        r = await http.post(url, json=payload)
+        r.raise_for_status()
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start == -1:
+            raise ValueError(f"No JSON in judge response: {text[:300]}")
+        return json.loads(text[start:end])
+
+
+# ── Gemini: optimize ──────────────────────────────────────────────────────────
+
+async def gemini_optimize(
+    key_name: str,
+    current_instruction: str,
+    feedback: str,
+    key: str,
+) -> str:
+    """Use Gemini to write an improved instruction based on aggregated feedback."""
+    context = {
+        "direct_render_instruction": (
+            "This instruction is given directly to an IMAGE GENERATION model. "
+            "It receives: Image 1 = architectural mass/wireframe, Image 2 = style reference render. "
+            "It must output a photorealistic rendered image."
+        ),
+        "analyzer_instruction": (
+            "This instruction is given to a TEXT model that acts as an analyst. "
+            "It receives: Image 1 = architectural mass/wireframe, Image 2 = style reference render. "
+            "It must output a 300-500 word text prompt that will then be given to an IMAGE GENERATION model. "
+            "The analyst's job is to describe the geometry and style so precisely that the image generator "
+            "cannot deviate from them."
+        ),
+    }.get(key_name, "This is an instruction for an architectural visualization AI.")
+
+    opt_prompt = (
+        f"You are a prompt engineer specializing in architectural visualization AI.\n\n"
+        f"CONTEXT: {context}\n\n"
+        "TASK: Rewrite the instruction below to fix the failures listed in the test results.\n\n"
+        "CURRENT INSTRUCTION:\n"
+        "---\n" + current_instruction + "\n---\n\n"
+        "AGGREGATED TEST FAILURES:\n"
+        "---\n" + feedback + "\n---\n\n"
+        "Write an IMPROVED instruction. Focus especially on:\n"
+        "1. Geometry and silhouette preservation — this is the hardest constraint for image models.\n"
+        "2. Height fidelity — towers must not be compressed, stretched, or rescaled.\n"
+        "3. Preventing the model from 'redesigning' the building.\n\n"
+        "Be very explicit, concrete, and commanding. Use ALL CAPS for the most critical constraints.\n"
+        "Return ONLY the new instruction text — no explanation, no markdown, no preamble."
+    )
+
+    payload = {"contents": [{"parts": [{"text": opt_prompt}]}]}
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-pro:generateContent?key={key}"
+    )
+    async with httpx.AsyncClient(timeout=180) as http:
+        r = await http.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+# ── Triplet finder ─────────────────────────────────────────────────────────────
+
+def find_triplets(folder: Path) -> list[dict]:
+    triplets = []
+    for subdir in sorted(folder.iterdir()):
+        if not subdir.is_dir():
+            continue
+        images = [p for p in subdir.iterdir() if p.suffix.lower() in ALLOWED_SUFFIXES]
+        mass   = next((p for p in images if "--mass"   in p.stem.lower()), None)
+        render = next((p for p in images if "--render" in p.stem.lower()), None)
+        result = next((p for p in images if "--result" in p.stem.lower()), None)
+        if not mass or not render or not result:
+            missing = [n for n, p in [("mass", mass), ("render", render), ("result", result)] if not p]
+            print(f"  [skip] {subdir.name}: missing {', '.join(missing)}")
+            continue
+        triplets.append({"name": subdir.name, "mass": mass, "render": render, "result": result})
+    return triplets
+
+
+# ── Score helpers ─────────────────────────────────────────────────────────────
+
+def _avg(scores: list[dict], key: str) -> float:
+    vals = [s[key] for s in scores if isinstance(s.get(key), (int, float))]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def composite_score(scores: list[dict]) -> float:
+    """Weighted composite: geometry 40 % + height 30 % + style 20 % + overall 10 %"""
+    return (
+        0.40 * _avg(scores, "geometry_fidelity")
+        + 0.30 * _avg(scores, "height_preservation")
+        + 0.20 * _avg(scores, "style_quality")
+        + 0.10 * _avg(scores, "overall_quality")
+    )
+
+
+def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
+    lines = []
+    for name, score in zip(names, scores):
+        if not score:
+            continue
+        lines.append(
+            f"[{name}] geometry={score.get('geometry_fidelity','?')}/10 "
+            f"height={score.get('height_preservation','?')}/10 "
+            f"style={score.get('style_quality','?')}/10 "
+            f"overall={score.get('overall_quality','?')}/10"
+        )
+        for issue in (score.get("issues") or [])[:2]:
+            lines.append(f"  issue: {issue}")
+        delta = (score.get("geometry_delta") or "").strip()
+        if delta:
+            lines.append(f"  geometry_delta: {delta[:250]}")
+    lines.append(
+        f"\nAverages across {len(scores)} case(s): "
+        f"geometry={_avg(scores,'geometry_fidelity'):.1f} "
+        f"height={_avg(scores,'height_preservation'):.1f} "
+        f"style={_avg(scores,'style_quality'):.1f} "
+        f"overall={_avg(scores,'overall_quality'):.1f}"
+    )
+    return "\n".join(lines)
+
+
+# ── One iteration ─────────────────────────────────────────────────────────────
+
+async def run_iteration(
+    triplets: list[dict],
+    instruction: str,
+    key: str,
+    output_dir: Path,
+    iteration: int,
+) -> tuple[list[dict], list[Optional[bytes]]]:
+    scores: list[dict] = []
+    images: list[Optional[bytes]] = []
+
+    for triplet in triplets:
+        name = triplet["name"]
+        print(f"  Generating [{name}] ...", flush=True)
+        img = await gemini_generate(triplet["mass"], triplet["render"], instruction, key)
+        images.append(img)
+
+        if img is None:
+            print(f"  [{name}] generation failed, skipping judge")
+            scores.append({})
+            continue
+
+        out_path = output_dir / f"iter{iteration:02d}_{name}.png"
+        out_path.write_bytes(img)
+
+        print(f"  Judging  [{name}] ...", flush=True)
+        try:
+            score = await gemini_judge(triplet["mass"], triplet["result"], img, key)
+            scores.append(score)
+            print(
+                f"  [{name}] geometry={score.get('geometry_fidelity','?')} "
+                f"height={score.get('height_preservation','?')} "
+                f"style={score.get('style_quality','?')}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"  [{name}] judge error: {exc}", flush=True)
+            scores.append({})
+
+    return scores, images
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+async def main_async() -> None:
+    parser = argparse.ArgumentParser(
+        description="ArchRender AI — Prompt Optimization Agent"
+    )
+    parser.add_argument(
+        "--folder", type=Path, required=True,
+        help="Parent folder whose subdirs contain --mass, --render, and --result files",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=4,
+        help="Optimization iterations (default: 4)",
+    )
+    parser.add_argument(
+        "--tab", choices=list(TAB_DEFAULT_KEY.keys()), default=None,
+        help="Tab to optimize: style-transfer or update-render. "
+             "Sets --prompt automatically if --prompt is not given.",
+    )
+    parser.add_argument(
+        "--prompt", choices=OPTIMIZABLE_KEYS, default=None,
+        help=f"Which prompt key to optimize. "
+             f"Options: {', '.join(OPTIMIZABLE_KEYS)}. "
+             "Defaults to the primary key for --tab (or direct_render_instruction).",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Directory to save intermediate outputs and scores (default: ./opt_runs/<id>)",
+    )
+    parser.add_argument(
+        "--key", default=None,
+        help="Gemini API key (default: GEMINI_API_KEY env var)",
+    )
+    args = parser.parse_args()
+
+    key = args.key or os.getenv("GEMINI_API_KEY", "")
+    if not key:
+        print("ERROR: GEMINI_API_KEY not set. Use --key or set the environment variable.", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.folder.is_dir():
+        print(f"ERROR: --folder is not a directory: {args.folder}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = args.output_dir or (BASE_DIR / "opt_runs" / str(uuid.uuid4())[:8])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output dir: {output_dir}\n")
+
+    # Find triplets
+    print("Scanning for triplets (mass + render + result)...")
+    triplets = find_triplets(args.folder)
+    if not triplets:
+        print(
+            "ERROR: No valid triplets found.\n"
+            "Each subfolder needs a --mass file, a --render file, AND a --result file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"Found {len(triplets)} triplet(s): {[t['name'] for t in triplets]}\n")
+
+    # Resolve which prompt key to optimize
+    if args.prompt:
+        prompt_key = args.prompt
+    elif args.tab:
+        prompt_key = TAB_DEFAULT_KEY[args.tab]
+    else:
+        prompt_key = "direct_render_instruction"
+
+    # Load current prompts
+    config = load_prompt_config()
+    instruction = get_instruction(config, prompt_key)
+    print(f"Optimizing: {prompt_key}")
+    print(f"Starting instruction ({len(instruction)} chars):\n{instruction[:200]}...\n")
+
+    best_score = -1.0
+    best_instruction = instruction
+    best_iteration = 0
+    history = []
+
+    print(f"{'─' * 64}")
+    for iteration in range(1, args.iterations + 1):
+        print(f"\n── Iteration {iteration}/{args.iterations} {'─' * 44}")
+
+        scores, _ = await run_iteration(triplets, instruction, key, output_dir, iteration)
+        valid = [s for s in scores if s]
+
+        if not valid:
+            print("  No valid scores this iteration.")
+            continue
+
+        cscore = composite_score(valid)
+        valid_names = [t["name"] for t, s in zip(triplets, scores) if s]
+        feedback = build_feedback_summary(valid, valid_names)
+
+        print(f"\n  Composite score: {cscore:.2f}/10  "
+              f"(geometry={_avg(valid,'geometry_fidelity'):.1f} "
+              f"height={_avg(valid,'height_preservation'):.1f} "
+              f"style={_avg(valid,'style_quality'):.1f})")
+
+        history.append({
+            "iteration": iteration,
+            "composite": cscore,
+            "geometry": _avg(valid, "geometry_fidelity"),
+            "height": _avg(valid, "height_preservation"),
+            "style": _avg(valid, "style_quality"),
+            "instruction": instruction,
+        })
+
+        if cscore > best_score:
+            best_score = cscore
+            best_instruction = instruction
+            best_iteration = iteration
+            print("  ✓ New best — saving to prompt_config.json")
+            config[prompt_key] = best_instruction
+            save_prompt_config(config)
+
+        # Save per-iteration scores
+        (output_dir / f"iter{iteration:02d}_scores.json").write_text(
+            json.dumps({
+                "iteration": iteration, "composite": cscore,
+                "cases": [{"name": t["name"], "scores": s} for t, s in zip(triplets, scores)],
+                "instruction": instruction,
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+        # Generate improved instruction for next iteration
+        if iteration < args.iterations:
+            print(f"\n  Generating improved instruction...")
+            try:
+                instruction = await gemini_optimize(prompt_key, instruction, feedback, key)
+                print(f"  New instruction ({len(instruction)} chars): {instruction[:120]}...")
+            except Exception as exc:
+                print(f"  Optimizer error: {exc} — keeping current instruction")
+
+    # Final summary
+    print(f"\n{'─' * 64}")
+    print(f"Best iteration : {best_iteration}")
+    print(f"Best score     : {best_score:.2f}/10")
+
+    # Save history
+    (output_dir / "optimization_history.json").write_text(
+        json.dumps(history, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"History saved  : {output_dir / 'optimization_history.json'}")
+    print("\nDone! The optimized prompts are already in prompt_config.json.")
+    print("The running server picks them up on the next request (no restart needed).")
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

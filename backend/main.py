@@ -43,6 +43,23 @@ def _bundle_dir() -> Path:
 BASE_DIR = _base_dir()
 BUNDLE_DIR = _bundle_dir()
 
+PROMPT_CONFIG_PATH = BASE_DIR / "prompt_config.json"
+
+
+def _load_prompt(key: str, default: str) -> str:
+    """Load a prompt override from prompt_config.json; falls back to default.
+    File is re-read on every call so the optimizer can update prompts while the
+    server is running without requiring a restart."""
+    try:
+        if PROMPT_CONFIG_PATH.exists():
+            cfg = json.loads(PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
+            if key in cfg and isinstance(cfg[key], str) and cfg[key].strip():
+                return cfg[key]
+    except Exception:
+        pass
+    return default
+
+
 app = FastAPI(title="ArchRender AI API")
 
 app.add_middleware(
@@ -108,7 +125,7 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
     mass_b64, mass_mime = _b64(mass_path)
     ref_b64, ref_mime = _b64(reference_path)
 
-    instruction = (
+    instruction = _load_prompt("direct_render_instruction", (
         "You are an expert architectural visualization artist. "
         "The first image is an architectural mass/volume model — treat it as a strict geometric blueprint. "
         "The second image is a reference architectural render showing the desired materials and style. "
@@ -128,7 +145,7 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         "\nSTYLE (from Image 2 only): apply the facade materials, glass type and color, structural "
         "finish, lighting, sky, vegetation, and overall atmosphere.\n"
         "Output only the rendered image, no text."
-    )
+    ))
     if prompt.strip():
         instruction += f" Additional direction: {prompt.strip()}"
 
@@ -190,7 +207,7 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
     mass_b64, mass_mime = _b64(mass_path)
     ref_b64, ref_mime = _b64(reference_path)
 
-    instruction = (
+    instruction = _load_prompt("analyzer_instruction", (
         "You are a senior architectural visualization director. "
         "Analyze both images carefully:\n"
         "- Image 1: an architectural mass/volume model — the EXACT geometric blueprint.\n"
@@ -219,7 +236,7 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
         "- Surrounding context, ground, vegetation.\n"
         "- Camera angle and framing.\n\n"
         "Output only the prompt text, no preamble."
-    )
+    ))
     if extra_prompt.strip():
         instruction += f"\n\nAdditional direction from the user: {extra_prompt.strip()}"
 
@@ -234,7 +251,7 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
     }
 
     _url = f"https://generativelanguage.googleapis.com/v1beta/models/{analyzer_model}:generateContent?key={key}"
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx.AsyncClient(timeout=180) as http:
         r = await http.post(_url, json=payload)
         r.raise_for_status()
         data = r.json()
@@ -245,6 +262,84 @@ async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = 
     """Two-step: Gemini analyzer writes detailed prompt → image-gen model renders."""
     rich_prompt = await gemini_25_analyze(mass_path, reference_path, prompt, analyzer_model)
     return await gemini_generate_render(mass_path, reference_path, rich_prompt)
+
+
+async def gemini_generate_render_update(mass_path: Path, render_path: Path, prompt: str = "") -> Path:
+    """Like gemini_generate_render but uses the update-render instruction (scene integration)."""
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    mass_b64, mass_mime = _b64(mass_path)
+    ref_b64, ref_mime = _b64(render_path)
+
+    instruction = _load_prompt("update_render_direct_instruction", (
+        "You are an expert architectural visualization artist. "
+        "Image 1 is a new architectural mass/volume model — the EXACT geometric blueprint for a new building. "
+        "Image 2 is an existing photorealistic render of a site whose building will be replaced.\n\n"
+        "CRITICAL — TASK: Replace the building in Image 2 with the new building defined by Image 1. "
+        "The result must look like the new building was ALWAYS PART OF THE SCENE in Image 2.\n\n"
+        "GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
+        "- SILHOUETTE: Reproduce the EXACT outer silhouette of Image 1 — do not alter height, width, or outline.\n"
+        "- HEIGHT: Tower height is a fixed constraint. Do NOT compress, elongate, or rescale vertically.\n"
+        "- PROPORTIONS: Width-to-height ratio must match Image 1 exactly.\n"
+        "- Preserve every feature: crown shape, podium, setbacks, connecting elements, lattice structures.\n"
+        "- Do NOT simplify, redesign, or 'improve' any aspect of the geometry from Image 1.\n\n"
+        "SCENE INTEGRATION (from Image 2):\n"
+        "- Match the camera angle, perspective, and focal length of Image 2 EXACTLY.\n"
+        "- Preserve ALL surrounding elements unchanged: sky, roads, vegetation, other buildings, infrastructure.\n"
+        "- Match the lighting direction, quality, and color temperature of Image 2.\n"
+        "- The new building must cast shadows consistent with Image 2's sun angle and atmosphere.\n"
+        "- Adapt facade materials to look photorealistic within Image 2's environmental context.\n"
+        "Output only the rendered image, no text."
+    ))
+    if prompt.strip():
+        instruction += f" Additional direction: {prompt.strip()}"
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": instruction},
+            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+            {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini update-render] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"No Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+            out_path.write_bytes(img_bytes)
+            return out_path
+
+    raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
 async def gemini_25_analyze_three_image(
@@ -279,7 +374,7 @@ async def gemini_25_analyze_three_image(
     mod_b64, mod_mime = _b64(modified_mass_path)
     ref_b64, ref_mime = _b64(reference_path)
 
-    instruction = (
+    instruction = _load_prompt("analyzer_three_image_instruction", (
         "You are a senior architectural visualization director. "
         "Analyze all three images carefully:\n"
         "- Image 1: the ORIGINAL architectural mass model (baseline geometry — before any design edits).\n"
@@ -303,7 +398,7 @@ async def gemini_25_analyze_three_image(
         "6. Surrounding context, ground, vegetation (from Image 3)\n"
         "7. Camera angle and framing (match Image 2's perspective exactly)\n"
         "Output only the prompt text, no preamble."
-    )
+    ))
     if extra_prompt.strip():
         instruction += f"\n\nAdditional direction from the user: {extra_prompt.strip()}"
 
@@ -319,7 +414,7 @@ async def gemini_25_analyze_three_image(
     }
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{analyzer_model}:generateContent?key={key}"
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx.AsyncClient(timeout=180) as http:
         r = await http.post(url, json=payload)
         r.raise_for_status()
         data = r.json()
@@ -352,7 +447,7 @@ async def gemini_generate_render_three_image(
     mod_b64, mod_mime = _b64(modified_mass_path)
     ref_b64, ref_mime = _b64(reference_path)
 
-    instruction = (
+    instruction = _load_prompt("direct_render_three_image_instruction", (
         "You are an expert architectural visualization artist. "
         "You are given three images:\n"
         "- Image 1: the ORIGINAL architectural mass model (baseline — before design edits).\n"
@@ -372,7 +467,7 @@ async def gemini_generate_render_three_image(
         "the exact style of Image 3: match its facade materials, glass type and color, structural elements, "
         "lighting, sky, vegetation, and overall atmosphere. "
         "Output only the rendered image, no text."
-    )
+    ))
     if prompt.strip():
         instruction += f" Additional direction: {prompt.strip()}"
 
@@ -769,7 +864,7 @@ async def run_controlnet_render(
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
         elif model == "gemini-direct":
-            out_path = await gemini_generate_render(mass_path, render_path, prompt)
+            out_path = await gemini_generate_render_update(mass_path, render_path, prompt)
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
 
