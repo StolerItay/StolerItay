@@ -47,6 +47,13 @@ except ImportError:
     print("httpx not installed. Run: pip install httpx", file=sys.stderr)
     sys.exit(1)
 
+# Load .env from the same directory as this script (same as main.py)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # dotenv optional; user can set env vars manually
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 PROMPT_CONFIG_PATH = BASE_DIR / "prompt_config.json"
