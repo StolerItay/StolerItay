@@ -112,12 +112,19 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         "You are an expert architectural visualization artist. "
         "The first image is an architectural mass/volume model — treat it as a strict geometric blueprint. "
         "The second image is a reference architectural render showing the desired materials and style. "
-        "\n\nCRITICAL — GEOMETRY RULES (from Image 1, non-negotiable):\n"
-        "- Reproduce the EXACT number of towers and their relative heights.\n"
+        "\n\nCRITICAL — GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
+        "- SILHOUETTE: The outer silhouette of the building must be PIXEL-IDENTICAL to Image 1. "
+        "Do not alter the boundary, outline, or overall form in any way.\n"
+        "- HEIGHT: The height of each tower is a fixed constraint. Do NOT compress, elongate, or "
+        "rescale any building vertically. Tower heights and their ratios must be preserved exactly.\n"
+        "- PROPORTIONS: Each tower's width-to-height ratio must match Image 1 exactly. "
+        "Do not make towers wider, narrower, taller, or shorter than shown.\n"
+        "- Reproduce the EXACT number of towers and their relative positions.\n"
         "- Preserve the precise crown/top profile of every tower (shape, slant, cutouts, fins).\n"
         "- Keep every connecting element: sky bridges, structural links, transitions between towers.\n"
         "- Maintain the base/podium form: its footprint, curved elements, canopy, or lattice structure.\n"
-        "- Do NOT simplify, merge, add, or omit any architectural feature shown in the mass.\n"
+        "- Do NOT simplify, merge, add, smooth, or omit any architectural feature shown in the mass.\n"
+        "- This is a STYLE TRANSFER only — you are changing materials and lighting, NOT redesigning the building.\n"
         "\nSTYLE (from Image 2 only): apply the facade materials, glass type and color, structural "
         "finish, lighting, sky, vegetation, and overall atmosphere.\n"
         "Output only the rendered image, no text."
@@ -191,13 +198,19 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
         "Write a detailed image generation prompt (300-500 words) that will guide an AI image model "
         "to render Image 1's geometry in the exact style of Image 2.\n\n"
         "SECTION 1 — GEOMETRY (from Image 1, must be described with full precision):\n"
-        "- Exact number of towers and their relative heights and proportions.\n"
+        "- Exact number of towers and their relative heights. Express each tower's height as a "
+        "fraction of the tallest tower (e.g. 'main tower full height, secondary tower 60% as tall').\n"
+        "- CRITICAL: describe the exact outer silhouette of the entire composition — this is the "
+        "single most important constraint; the generated image must match it exactly.\n"
         "- Crown/top profile of each tower: describe the exact shape, any cutouts, fins, tapers, or distinctive terminations.\n"
         "- All connecting elements: sky bridges, structural links, podium transitions between towers — describe location and form.\n"
         "- Base/podium structure: footprint, curved or lattice elements, canopy, entrance volumes.\n"
         "- Any other distinctive geometric features (setbacks, chamfers, openings).\n"
-        "IMPORTANT: instruct the image model to reproduce every one of these features EXACTLY. "
-        "It must NOT simplify, merge, add, or omit any feature from the mass.\n\n"
+        "IMPORTANT: the prompt you write must explicitly instruct the image model that:\n"
+        "1. The outer silhouette and every tower's height must be IDENTICAL to Image 1 — "
+        "do not alter height, width, or outline under any circumstances.\n"
+        "2. This is a STYLE TRANSFER only — change materials and lighting, NOT the building geometry.\n"
+        "3. It must NOT compress, elongate, widen, narrow, simplify, merge, add, or omit any feature.\n\n"
         "SECTION 2 — STYLE (from Image 2 only):\n"
         "- Facade materials, textures, colors, glass type.\n"
         "- Structural and architectural surface details.\n"
@@ -277,8 +290,12 @@ async def gemini_25_analyze_three_image(
         "(new volumes, changed profiles, added bulges, shifted silhouettes, new elements).\n\n"
         "Then write a detailed image generation prompt (300-500 words) that will guide an AI image model "
         "to render Image 2's exact geometry in the style of Image 3. Cover:\n"
-        "1. Building geometry from Image 2 — describe the modified form in precise detail, "
-        "explicitly calling out every intentional deviation from Image 1 so the generator does not 'correct' them\n"
+        "1. Building geometry from Image 2 — describe the modified form with full precision:\n"
+        "   - Explicitly state each tower's height as a fraction of the tallest tower.\n"
+        "   - Describe the exact outer silhouette — instruct the generator that it must be IDENTICAL.\n"
+        "   - Call out every intentional deviation from Image 1 so the generator does not 'correct' them.\n"
+        "   - Instruct the generator: this is a STYLE TRANSFER only — do NOT alter height, width, "
+        "silhouette, or proportions; do NOT compress, elongate, widen, or narrow any element.\n"
         "2. Facade materials, textures, colors, glass type (from Image 3)\n"
         "3. Structural and architectural details (from Image 3)\n"
         "4. Lighting conditions, time of day, shadows (from Image 3)\n"
@@ -343,7 +360,15 @@ async def gemini_generate_render_three_image(
         "Every geometric difference from Image 1 is intentional. Preserve all changes exactly — "
         "do not smooth, correct, or revert any deviation.\n"
         "- Image 3: a photorealistic reference render showing the target visual style.\n\n"
-        "Generate a photorealistic architectural visualization of Image 2's geometry rendered in "
+        "CRITICAL — GEOMETRY RULES (from Image 2, absolutely non-negotiable):\n"
+        "- SILHOUETTE: The outer silhouette of the building must match Image 2 EXACTLY. "
+        "Do not alter the height, width, outline, or proportions in any way.\n"
+        "- HEIGHT: The height of each tower is a fixed constraint. Do NOT compress, elongate, or "
+        "rescale any building vertically. Tower heights and their ratios must be preserved exactly.\n"
+        "- PROPORTIONS: Width-to-height ratios must match Image 2 exactly for every element.\n"
+        "- Do NOT simplify, merge, add, or omit any architectural feature.\n"
+        "- This is a STYLE TRANSFER only — change materials and lighting, NOT the building's shape.\n\n"
+        "Generate a photorealistic architectural visualization of Image 2's exact geometry rendered in "
         "the exact style of Image 3: match its facade materials, glass type and color, structural elements, "
         "lighting, sky, vegetation, and overall atmosphere. "
         "Output only the rendered image, no text."
@@ -775,7 +800,7 @@ async def run_controlnet_render(
 
         jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
 
 
 async def run_style_transfer(
@@ -868,7 +893,7 @@ async def run_style_transfer(
 
         jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
 
 
 async def run_new_angle(
@@ -925,7 +950,7 @@ async def run_new_angle(
 
         jobs[job_id].update({"status": "done", "output_url": output_url})
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
 
 
 async def run_inpaint(
@@ -996,7 +1021,7 @@ async def run_inpaint(
         jobs[job_id].update({"status": "done", "output_url": output_url})
         mask_path.unlink(missing_ok=True)
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
