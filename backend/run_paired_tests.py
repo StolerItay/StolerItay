@@ -124,7 +124,9 @@ def poll_all(server: str, job_entries: list[dict], client: httpx.Client) -> None
                     data = r.json()
                     entry["status"] = data["status"]
                     entry["output_url"] = data.get("output_url")
-                    entry["error_msg"] = data.get("error")
+                    entry["error_msg"] = data.get("error") or (
+                        "job failed (no details from server)" if data["status"] == "error" else None
+                    )
                     if entry["status"] == "done":
                         done += 1
                     elif entry["status"] == "error":
