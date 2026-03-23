@@ -24,7 +24,8 @@ export async function submitStyleTransfer(
   massFile: File,
   prompt: string,
   model: string,
-  apiKey?: string
+  apiKey?: string,
+  originalMassFile?: File | null,
 ): Promise<{ jobId: string }> {
   const form = new FormData();
   form.append('reference', referenceFile);
@@ -32,6 +33,7 @@ export async function submitStyleTransfer(
   form.append('prompt', prompt);
   form.append('model', model);
   if (apiKey) form.append('replicate_api_token', apiKey);
+  if (originalMassFile) form.append('original_mass', originalMassFile);
   const { data } = await axios.post(`${BASE}/style-transfer`, form);
   return data;
 }

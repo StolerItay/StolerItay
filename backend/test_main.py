@@ -57,9 +57,28 @@ def mock_gemini(monkeypatch, tmp_path):
     async def _fake_gemini_describe(image_path, extra_prompt=""):
         return extra_prompt or "modern glass and steel facade"
 
+    # Three-image workflow mocks
+    async def _fake_gemini_25_analyze_three(original_mass_path, modified_mass_path, reference_path,
+                                             extra_prompt="", analyzer_model="gemini-2.5-pro"):
+        return extra_prompt or "delta-aware render prompt: bulging tower preserved, twilight lighting"
+
+    async def _fake_gemini_generate_render_three(original_mass_path, modified_mass_path, reference_path, prompt=""):
+        out = tmp_path / f"fake_gemini3img_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
+    async def _fake_gemini_25_render_three(original_mass_path, modified_mass_path, reference_path,
+                                            prompt="", analyzer_model="gemini-2.5-pro"):
+        out = tmp_path / f"fake_gemini25_3img_{uuid.uuid4()}.png"
+        out.write_bytes(_png_bytes_local())
+        return out
+
     monkeypatch.setattr("main.gemini_generate_render", _fake_gemini_render)
     monkeypatch.setattr("main.gemini_25_render", _fake_gemini_25_render)
     monkeypatch.setattr("main.gemini_describe_style", _fake_gemini_describe)
+    monkeypatch.setattr("main.gemini_25_analyze_three_image", _fake_gemini_25_analyze_three)
+    monkeypatch.setattr("main.gemini_generate_render_three_image", _fake_gemini_generate_render_three)
+    monkeypatch.setattr("main.gemini_25_render_three_image", _fake_gemini_25_render_three)
 
 
 # Import app after patching
@@ -304,6 +323,82 @@ class TestInpaint:
         job_id = r.json()["jobId"]
         result = _wait_for_job(job_id)
         assert result["status"] == "done"
+
+
+# ── /api/style-transfer (three-image delta workflow) ─────────────────────────
+
+class TestStyleTransferThreeImage:
+    """Three-image workflow: reference + modified mass + original mass (delta mode)."""
+
+    def test_three_image_returns_job_id(self):
+        r = client.post(
+            "/api/style-transfer",
+            files={
+                "reference": _png_file("ref.png"),
+                "mass": _png_file("modified_mass.png"),
+                "original_mass": _png_file("original_mass.png"),
+            },
+            data={"prompt": "twilight lighting, warm glow", "model": "gemini-25-pro"},
+        )
+        assert r.status_code == 200
+        assert "jobId" in r.json()
+
+    def test_three_image_job_reaches_done(self):
+        r = client.post(
+            "/api/style-transfer",
+            files={
+                "reference": _png_file("ref.png"),
+                "mass": _png_file("modified_mass.png"),
+                "original_mass": _png_file("original_mass.png"),
+            },
+            data={"model": "gemini-25-pro"},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+        assert result["output_url"].startswith("/outputs/")
+
+    @pytest.mark.parametrize("model", [
+        "gemini-25-pro", "gemini-25-flash", "gemini-direct",
+        "flux-redux-controlnet", "sdxl-img2img",
+    ])
+    def test_three_image_all_gemini_models_reach_done(self, model):
+        r = client.post(
+            "/api/style-transfer",
+            files={
+                "reference": _png_file("ref.png"),
+                "mass": _png_file("mass.png"),
+                "original_mass": _png_file("orig.png"),
+            },
+            data={"model": model},
+        )
+        assert r.status_code == 200, f"model {model} rejected at submission"
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done", f"model {model} did not reach done: {result}"
+
+    def test_two_image_still_works_without_original_mass(self):
+        """Backward compatibility: omitting original_mass uses the existing two-image path."""
+        r = client.post(
+            "/api/style-transfer",
+            files={"reference": _png_file(), "mass": _png_file()},
+            data={"model": "gemini-25-pro"},
+        )
+        result = _wait_for_job(r.json()["jobId"])
+        assert result["status"] == "done"
+
+    def test_three_image_gemini_models_return_local_url(self):
+        for model in ("gemini-25-pro", "gemini-25-flash", "gemini-direct"):
+            r = client.post(
+                "/api/style-transfer",
+                files={
+                    "reference": _png_file(),
+                    "mass": _png_file(),
+                    "original_mass": _png_file(),
+                },
+                data={"model": model},
+            )
+            result = _wait_for_job(r.json()["jobId"])
+            assert result["output_url"].startswith("/outputs/"), \
+                f"{model} three-image returned unexpected url: {result['output_url']}"
 
 
 # ── /api/job/{id} ────────────────────────────────────────────────────────────

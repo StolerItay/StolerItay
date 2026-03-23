@@ -212,6 +212,189 @@ async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = 
     return await gemini_generate_render(mass_path, reference_path, rich_prompt)
 
 
+async def gemini_25_analyze_three_image(
+    original_mass_path: Path,
+    modified_mass_path: Path,
+    reference_path: Path,
+    extra_prompt: str = "",
+    analyzer_model: str = "gemini-2.5-pro",
+) -> str:
+    """
+    Delta-aware analyst for the three-image workflow.
+
+    Learns from the existing two-step chain pattern but extends it:
+    - Image 1 = original geometry (baseline — before edits)
+    - Image 2 = modified geometry (after edits — ALL changes are intentional)
+    - Image 3 = photorealistic style reference
+
+    The analyst identifies the geometry delta (what changed between 1 and 2),
+    then writes a rich 300-500 word render prompt that locks in the new form
+    while applying Image 3's materials, lighting, and atmosphere.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    orig_b64, orig_mime = _b64(original_mass_path)
+    mod_b64, mod_mime = _b64(modified_mass_path)
+    ref_b64, ref_mime = _b64(reference_path)
+
+    instruction = (
+        "You are a senior architectural visualization director. "
+        "Analyze all three images carefully:\n"
+        "- Image 1: the ORIGINAL architectural mass model (baseline geometry — before any design edits).\n"
+        "- Image 2: the MODIFIED architectural mass model (updated design — after edits). "
+        "Every geometric difference from Image 1 is an intentional design decision and must be preserved exactly.\n"
+        "- Image 3: a photorealistic reference render showing the target visual style.\n\n"
+        "First, identify every geometric difference between Image 1 and Image 2 "
+        "(new volumes, changed profiles, added bulges, shifted silhouettes, new elements).\n\n"
+        "Then write a detailed image generation prompt (300-500 words) that will guide an AI image model "
+        "to render Image 2's exact geometry in the style of Image 3. Cover:\n"
+        "1. Building geometry from Image 2 — describe the modified form in precise detail, "
+        "explicitly calling out every intentional deviation from Image 1 so the generator does not 'correct' them\n"
+        "2. Facade materials, textures, colors, glass type (from Image 3)\n"
+        "3. Structural and architectural details (from Image 3)\n"
+        "4. Lighting conditions, time of day, shadows (from Image 3)\n"
+        "5. Sky, weather, atmosphere (from Image 3)\n"
+        "6. Surrounding context, ground, vegetation (from Image 3)\n"
+        "7. Camera angle and framing (match Image 2's perspective exactly)\n"
+        "Output only the prompt text, no preamble."
+    )
+    if extra_prompt.strip():
+        instruction += f"\n\nAdditional direction from the user: {extra_prompt.strip()}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": orig_mime, "data": orig_b64}},
+                {"inline_data": {"mime_type": mod_mime, "data": mod_b64}},
+                {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+            ]
+        }],
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{analyzer_model}:generateContent?key={key}"
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def gemini_generate_render_three_image(
+    original_mass_path: Path,
+    modified_mass_path: Path,
+    reference_path: Path,
+    prompt: str = "",
+) -> Path:
+    """
+    Direct three-image render (no separate analyst step).
+
+    Mirrors gemini_generate_render but sends all three images so the model can
+    see the geometry delta directly and won't auto-correct intentional design changes.
+    Follows the same model-fallback chain pattern as the two-image generator.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    orig_b64, orig_mime = _b64(original_mass_path)
+    mod_b64, mod_mime = _b64(modified_mass_path)
+    ref_b64, ref_mime = _b64(reference_path)
+
+    instruction = (
+        "You are an expert architectural visualization artist. "
+        "You are given three images:\n"
+        "- Image 1: the ORIGINAL architectural mass model (baseline — before design edits).\n"
+        "- Image 2: the MODIFIED architectural mass model (new design — after edits). "
+        "Every geometric difference from Image 1 is intentional. Preserve all changes exactly — "
+        "do not smooth, correct, or revert any deviation.\n"
+        "- Image 3: a photorealistic reference render showing the target visual style.\n\n"
+        "Generate a photorealistic architectural visualization of Image 2's geometry rendered in "
+        "the exact style of Image 3: match its facade materials, glass type and color, structural elements, "
+        "lighting, sky, vegetation, and overall atmosphere. "
+        "Output only the rendered image, no text."
+    )
+    if prompt.strip():
+        instruction += f" Additional direction: {prompt.strip()}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": orig_mime, "data": orig_b64}},
+                {"inline_data": {"mime_type": mod_mime, "data": mod_b64}},
+                {"inline_data": {"mime_type": ref_mime, "data": ref_b64}},
+            ]
+        }],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini 3-img direct] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"No Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+            out_path.write_bytes(img_bytes)
+            return out_path
+
+    raise ValueError(f"Gemini returned no image. Response: {data}")
+
+
+async def gemini_25_render_three_image(
+    original_mass_path: Path,
+    modified_mass_path: Path,
+    reference_path: Path,
+    prompt: str = "",
+    analyzer_model: str = "gemini-2.5-pro",
+) -> Path:
+    """
+    Three-image two-step chain:
+      gemini_25_analyze_three_image (delta-aware analyst) →
+      gemini_generate_render (image-gen on modified mass + reference)
+
+    Mirrors the two-image gemini_25_render pattern but the analyst now sees
+    the original geometry baseline so it can explicitly describe design deltas
+    and prevent the generator from 'correcting' intentional geometry changes.
+    """
+    rich_prompt = await gemini_25_analyze_three_image(
+        original_mass_path, modified_mass_path, reference_path, prompt, analyzer_model
+    )
+    return await gemini_generate_render(modified_mass_path, reference_path, rich_prompt)
+
+
 async def gemini_describe_style(image_path: Path, extra_prompt: str = "") -> str:
     """Use Gemini Vision (REST API) to extract a precise architectural style prompt from an image."""
     key = get_gemini_key()
@@ -372,27 +555,55 @@ async def run_style_transfer(
     model: str,
     job_id: str,
     api_token: Optional[str] = None,
+    original_mass_path: Optional[Path] = None,
 ) -> None:
-    """Style transfer: apply reference image style onto new mass."""
+    """Style transfer: apply reference image style onto new mass.
+
+    When original_mass_path is provided the pipeline uses the three-image workflow:
+    the analyst sees the geometry delta (original vs modified) so intentional design
+    changes are described explicitly and the generator won't auto-correct them.
+    """
     try:
         jobs[job_id]["status"] = "processing"
 
         token = get_api_token(api_token)
 
         if model == "gemini-25-pro":
-            out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-pro")
+            if original_mass_path:
+                out_path = await gemini_25_render_three_image(
+                    original_mass_path, mass_path, reference_path, prompt, analyzer_model="gemini-2.5-pro"
+                )
+            else:
+                out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-pro")
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "gemini-25-flash":
-            out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash")
+            if original_mass_path:
+                out_path = await gemini_25_render_three_image(
+                    original_mass_path, mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash"
+                )
+            else:
+                out_path = await gemini_25_render(mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash")
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "gemini-direct":
-            out_path = await gemini_generate_render(mass_path, reference_path, prompt)
+            if original_mass_path:
+                out_path = await gemini_generate_render_three_image(
+                    original_mass_path, mass_path, reference_path, prompt
+                )
+            else:
+                out_path = await gemini_generate_render(mass_path, reference_path, prompt)
             output_url = f"/outputs/{out_path.name}"
 
         elif model == "flux-redux-controlnet":
-            style_prompt = await gemini_describe_style(reference_path, prompt)
+            # When original mass is present, use the delta-aware analyst (flash) for a richer
+            # structural prompt instead of the single-image style extractor.
+            if original_mass_path:
+                style_prompt = await gemini_25_analyze_three_image(
+                    original_mass_path, mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash"
+                )
+            else:
+                style_prompt = await gemini_describe_style(reference_path, prompt)
             output_url = await replicate_run(
                 "black-forest-labs/flux-canny-pro",
                 {"control_image": open(mass_path, "rb"),
@@ -411,7 +622,12 @@ async def run_style_transfer(
                 token,
             )
         else:  # sdxl-img2img
-            style_prompt = await gemini_describe_style(reference_path, prompt)
+            if original_mass_path:
+                style_prompt = await gemini_25_analyze_three_image(
+                    original_mass_path, mass_path, reference_path, prompt, analyzer_model="gemini-2.5-flash"
+                )
+            else:
+                style_prompt = await gemini_describe_style(reference_path, prompt)
             output_url = await replicate_run(
                 "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
                 {"image": open(mass_path, "rb"), "prompt": style_prompt,
@@ -557,12 +773,20 @@ async def style_transfer(
     prompt: str = Form(""),
     model: str = Form("flux-redux-controlnet"),
     replicate_api_token: Optional[str] = Form(None),
+    original_mass: Optional[UploadFile] = File(None),
 ):
     reference_path = save_upload(reference)
     mass_path = save_upload(mass)
+    original_mass_path = (
+        save_upload(original_mass)
+        if original_mass and original_mass.filename
+        else None
+    )
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
-    asyncio.create_task(run_style_transfer(reference_path, mass_path, prompt, model, job_id, replicate_api_token))
+    asyncio.create_task(
+        run_style_transfer(reference_path, mass_path, prompt, model, job_id, replicate_api_token, original_mass_path)
+    )
     return {"jobId": job_id}
 
 
