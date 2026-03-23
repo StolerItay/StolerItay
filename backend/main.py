@@ -961,18 +961,25 @@ async def run_inpaint(
         }.get(inpaint_model, "black-forest-labs/flux-fill-pro")
 
         is_flux_fill = "flux-fill" in inpaint_model_id
-        model_input = {
-            "image": image_input,
-            "mask": open(mask_path, "rb"),
-            "prompt": full_prompt,
-            **({"num_inference_steps": 50, "guidance": 30, "output_format": "png"}
-               if is_flux_fill
-               else {"num_inference_steps": 50, "guidance_scale": 9.0,
-                     "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark"}),
-        }
+        mask_fh = open(mask_path, "rb")
+        try:
+            model_input = {
+                "image": image_input,
+                "mask": mask_fh,
+                "prompt": full_prompt,
+                **({"num_inference_steps": 50, "guidance": 30, "output_format": "png"}
+                   if is_flux_fill
+                   else {"num_inference_steps": 50, "guidance_scale": 9.0,
+                         "negative_prompt": "blurry, low quality, distorted, deformed, cartoon, illustration, painting, sketch, amateur, watermark"}),
+            }
 
-        token = get_api_token(api_token)
-        output_url = await replicate_run(inpaint_model_id, model_input, token)
+            token = get_api_token(api_token)
+            output_url = await replicate_run(inpaint_model_id, model_input, token)
+        finally:
+            mask_fh.close()
+            if hasattr(image_input, "close"):
+                image_input.close()
+
         jobs[job_id].update({"status": "done", "output_url": output_url})
         mask_path.unlink(missing_ok=True)
     except Exception as e:
