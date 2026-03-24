@@ -38,7 +38,7 @@ contains "--mass" is the wireframe/massing model; the one containing
 
 Output
 ------
-  Results printed to terminal and saved to paired_test_summary_<id>.json.
+  Results printed to terminal and saved to opt_runs/<folder_name>/paired_test_summary_<id>.json.
 """
 
 import argparse
@@ -288,11 +288,43 @@ def main() -> None:
         # ── Summary ───────────────────────────────────────────────────────────
         print_summary(job_entries, server)
 
-        # ── Save JSON ─────────────────────────────────────────────────────────
+        # ── Resolve output folder ──────────────────────────────────────────────
         run_id = str(uuid.uuid4())[:8]
-        out_path = args.output or Path(f"paired_test_summary_{run_id}.json")
-        out_path.write_text(json.dumps(job_entries, indent=2, default=str))
-        print(f"\nFull results saved to: {out_path}")
+        if args.output:
+            out_dir = args.output.parent
+            json_path = args.output
+        else:
+            out_dir = Path("opt_runs") / args.folder.name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            json_path = out_dir / f"paired_test_summary_{run_id}.json"
+
+        # ── Download output images into the same folder ────────────────────────
+        MODEL_SHORT = {
+            "gemini-25-pro":   "pro",
+            "gemini-25-flash": "flash",
+            "gemini-direct":   "direct",
+        }
+        print("\nDownloading output images…")
+        for entry in job_entries:
+            if entry["status"] != "done" or not entry.get("output_url"):
+                continue
+            url = entry["output_url"]
+            full_url = f"{server}{url}" if url.startswith("/") else url
+            model_short = MODEL_SHORT.get(entry["model"], entry["model"])
+            img_name = f"{entry['pair']}_{entry['tab']}_{model_short}.png"
+            img_path = out_dir / img_name
+            try:
+                r = client.get(full_url, timeout=30)
+                r.raise_for_status()
+                img_path.write_bytes(r.content)
+                entry["local_file"] = img_name
+                print(f"  Saved {img_name}")
+            except Exception as exc:
+                print(f"  WARN: could not download {img_name}: {exc}")
+
+        # ── Save JSON ─────────────────────────────────────────────────────────
+        json_path.write_text(json.dumps(job_entries, indent=2, default=str))
+        print(f"\nFull results saved to: {json_path}")
 
 
 if __name__ == "__main__":

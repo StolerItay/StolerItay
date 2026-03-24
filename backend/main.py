@@ -370,6 +370,43 @@ async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = 
     return await gemini_generate_render(mass_path, reference_path, rich_prompt)
 
 
+def _erase_building_from_render(mass_path: Path, render_path: Path) -> bytes:
+    """Erase the existing building from the render using the mass model silhouette as a mask.
+
+    Replaces the building region with a blurred fill so Gemini cannot copy the old building's
+    geometry or style — only the mass model remains as the building reference.
+    """
+    try:
+        from PIL import ImageFilter, ImageChops
+
+        render = _PILImage.open(render_path).convert("RGB")
+        mass = _PILImage.open(mass_path).convert("RGBA")
+        mass_resized = mass.resize(render.size, _PILImage.LANCZOS)
+
+        # Build mask: non-white / non-transparent pixels in mass = building footprint
+        r, g, b, a = mass_resized.split()
+        rgb = _PILImage.merge("RGB", (r, g, b))
+        white = _PILImage.new("RGB", mass_resized.size, (255, 255, 255))
+        delta = ImageChops.difference(rgb, white)
+        color_mask = delta.convert("L").point(lambda x: 255 if x > 20 else 0)
+        alpha_mask = a.point(lambda x: 255 if x > 30 else 0)
+        building_mask = _PILImage.new("L", render.size, 0)
+        building_mask.paste(color_mask, mask=color_mask)
+        building_mask.paste(alpha_mask, mask=alpha_mask)
+        # Dilate slightly to ensure full coverage
+        building_mask = building_mask.filter(ImageFilter.MaxFilter(size=21))
+
+        # Fill the building region with a heavy blur of the render (plausible background)
+        blurred = render.filter(ImageFilter.GaussianBlur(radius=40))
+        result = _PILImage.composite(blurred, render, building_mask)
+
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return render_path.read_bytes()
+
+
 async def gemini_generate_render_update(mass_path: Path, render_path: Path, prompt: str = "") -> Path:
     """Like gemini_generate_render but uses the update-render instruction (scene integration)."""
     key = get_gemini_key()
@@ -381,9 +418,13 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
         mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
         return base64.b64encode(p.read_bytes()).decode(), mime
 
+    # Erase the old building from the render so Gemini cannot copy it
+    clean_render_bytes = _erase_building_from_render(mass_path, render_path)
+
     # Original mass is sent to the generator (preserves scale/position in the scene)
     mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(render_path)
+    ref_b64 = base64.b64encode(clean_render_bytes).decode()
+    ref_mime = "image/png"
 
     # Crop for geometry extraction only (text model reads fine-detail better without white padding)
     cropped_for_extraction = _crop_mass_to_content(mass_path)
@@ -982,15 +1023,19 @@ async def run_controlnet_render(
         jobs[job_id]["status"] = "processing"
 
         # ── Gemini routes ────────────────────────────────────────────────────
-        if model == "gemini-25-pro":
-            out_path = await gemini_25_render(mass_path, render_path, prompt, analyzer_model="gemini-2.5-pro")
-            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
-            return
-        elif model == "gemini-25-flash":
-            out_path = await gemini_25_render(mass_path, render_path, prompt, analyzer_model="gemini-2.5-flash")
+        if model in ("gemini-25-pro", "gemini-25-flash"):
+            # Erase the old building so Gemini cannot copy its geometry/style.
+            clean_render_path = UPLOADS_DIR / f"clean_{uuid.uuid4().hex}.png"
+            clean_render_path.write_bytes(_erase_building_from_render(mass_path, render_path))
+            try:
+                analyzer = "gemini-2.5-pro" if model == "gemini-25-pro" else "gemini-2.5-flash"
+                out_path = await gemini_25_render(mass_path, clean_render_path, prompt, analyzer_model=analyzer)
+            finally:
+                clean_render_path.unlink(missing_ok=True)
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
         elif model == "gemini-direct":
+            # gemini_generate_render_update does its own erasing internally
             out_path = await gemini_generate_render_update(mass_path, render_path, prompt)
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
