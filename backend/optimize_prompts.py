@@ -252,16 +252,26 @@ async def gemini_judge(
         "- Image 1: architectural mass/wireframe model (exact geometric blueprint)\n"
         "- Image 2: expected photorealistic result (ground truth target)\n"
         "- Image 3: AI-generated output to evaluate\n\n"
-        "Score Image 3 on each criterion (integer 0-10):\n"
-        "  geometry_fidelity   — Does Image 3 match Image 1's silhouette, tower count, and proportions?\n"
-        "  height_preservation — Are each tower's heights preserved exactly from Image 1?\n"
-        "  style_quality       — Does Image 3 match Image 2's materials, lighting, atmosphere?\n"
-        "  overall_quality     — Overall photorealism and architectural quality.\n\n"
+        "Score Image 3 on EACH criterion (integer 0-10):\n"
+        "  geometry_fidelity    — Does Image 3 match Image 1's silhouette, tower count, and proportions?\n"
+        "  height_preservation  — Are each tower's heights preserved exactly from Image 1?\n"
+        "  style_quality        — Does Image 3 match Image 2's materials, textures, and facade details?\n"
+        "  scene_integration    — Does the new building look like it naturally belongs in the scene? "
+        "Are edges, perspective, and scale seamless with the surroundings?\n"
+        "  context_preservation — Are ALL surrounding elements from Image 2 unchanged: sky, roads, "
+        "vegetation, adjacent buildings, ground, infrastructure?\n"
+        "  lighting_match       — Does the building's lighting, shadows, and color temperature match "
+        "the scene's sun direction and atmosphere from Image 2?\n"
+        "  detail_fidelity      — Are architectural details correctly rendered: windows, floor lines, "
+        "balconies, facade panels, structural elements?\n"
+        "  overall_quality      — Overall photorealism and visual quality of Image 3 vs Image 2.\n\n"
         "Also provide:\n"
-        "  issues        — top 3 specific problems (geometry errors, height changes, missing elements)\n"
+        "  issues         — top 3 specific problems (geometry errors, integration artifacts, missing details)\n"
         "  geometry_delta — describe exactly how Image 3's geometry differs from Image 1\n\n"
         "Return ONLY valid JSON (no markdown, no extra text):\n"
-        '{"geometry_fidelity":0,"height_preservation":0,"style_quality":0,"overall_quality":0,'
+        '{"geometry_fidelity":0,"height_preservation":0,"style_quality":0,'
+        '"scene_integration":0,"context_preservation":0,"lighting_match":0,'
+        '"detail_fidelity":0,"overall_quality":0,'
         '"issues":["","",""],"geometry_delta":""}'
     )
 
@@ -326,6 +336,7 @@ async def gemini_optimize(
         "2. Height fidelity — towers must not be compressed, stretched, or rescaled.\n"
         "3. Preventing the model from 'redesigning' the building.\n\n"
         "Be very explicit, concrete, and commanding. Use ALL CAPS for the most critical constraints.\n"
+        "Focus especially on whichever criteria scored lowest in the test results above.\n"
         "Return ONLY the new instruction text — no explanation, no markdown, no preamble."
     )
 
@@ -367,12 +378,18 @@ def _avg(scores: list[dict], key: str) -> float:
 
 
 def composite_score(scores: list[dict]) -> float:
-    """Weighted composite: geometry 40 % + height 30 % + style 20 % + overall 10 %"""
+    """Weighted composite:
+    geometry 25% + height 20% + style 15% + scene_integration 15%
+    + context_preservation 10% + lighting_match 8% + detail_fidelity 7%
+    """
     return (
-        0.40 * _avg(scores, "geometry_fidelity")
-        + 0.30 * _avg(scores, "height_preservation")
-        + 0.20 * _avg(scores, "style_quality")
-        + 0.10 * _avg(scores, "overall_quality")
+        0.25 * _avg(scores, "geometry_fidelity")
+        + 0.20 * _avg(scores, "height_preservation")
+        + 0.15 * _avg(scores, "style_quality")
+        + 0.15 * _avg(scores, "scene_integration")
+        + 0.10 * _avg(scores, "context_preservation")
+        + 0.08 * _avg(scores, "lighting_match")
+        + 0.07 * _avg(scores, "detail_fidelity")
     )
 
 
@@ -382,9 +399,14 @@ def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
         if not score:
             continue
         lines.append(
-            f"[{name}] geometry={score.get('geometry_fidelity','?')}/10 "
+            f"[{name}] "
+            f"geometry={score.get('geometry_fidelity','?')}/10 "
             f"height={score.get('height_preservation','?')}/10 "
             f"style={score.get('style_quality','?')}/10 "
+            f"scene_integration={score.get('scene_integration','?')}/10 "
+            f"context_preservation={score.get('context_preservation','?')}/10 "
+            f"lighting_match={score.get('lighting_match','?')}/10 "
+            f"detail_fidelity={score.get('detail_fidelity','?')}/10 "
             f"overall={score.get('overall_quality','?')}/10"
         )
         for issue in (score.get("issues") or [])[:2]:
@@ -397,6 +419,10 @@ def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
         f"geometry={_avg(scores,'geometry_fidelity'):.1f} "
         f"height={_avg(scores,'height_preservation'):.1f} "
         f"style={_avg(scores,'style_quality'):.1f} "
+        f"scene_integration={_avg(scores,'scene_integration'):.1f} "
+        f"context_preservation={_avg(scores,'context_preservation'):.1f} "
+        f"lighting_match={_avg(scores,'lighting_match'):.1f} "
+        f"detail_fidelity={_avg(scores,'detail_fidelity'):.1f} "
         f"overall={_avg(scores,'overall_quality'):.1f}"
     )
     return "\n".join(lines)
@@ -445,7 +471,11 @@ async def run_iteration(
             print(
                 f"  [{name}] geometry={score.get('geometry_fidelity','?')} "
                 f"height={score.get('height_preservation','?')} "
-                f"style={score.get('style_quality','?')}",
+                f"style={score.get('style_quality','?')} "
+                f"scene={score.get('scene_integration','?')} "
+                f"context={score.get('context_preservation','?')} "
+                f"lighting={score.get('lighting_match','?')} "
+                f"detail={score.get('detail_fidelity','?')}",
                 flush=True,
             )
         except Exception as exc:
@@ -596,7 +626,11 @@ async def main_async() -> None:
         print(f"\n  Composite score: {cscore:.2f}/10  "
               f"(geometry={_avg(valid,'geometry_fidelity'):.1f} "
               f"height={_avg(valid,'height_preservation'):.1f} "
-              f"style={_avg(valid,'style_quality'):.1f})")
+              f"style={_avg(valid,'style_quality'):.1f} "
+              f"scene={_avg(valid,'scene_integration'):.1f} "
+              f"context={_avg(valid,'context_preservation'):.1f} "
+              f"lighting={_avg(valid,'lighting_match'):.1f} "
+              f"detail={_avg(valid,'detail_fidelity'):.1f})")
 
         history.append({
             "iteration": iteration,
@@ -604,6 +638,10 @@ async def main_async() -> None:
             "geometry": _avg(valid, "geometry_fidelity"),
             "height": _avg(valid, "height_preservation"),
             "style": _avg(valid, "style_quality"),
+            "scene_integration": _avg(valid, "scene_integration"),
+            "context_preservation": _avg(valid, "context_preservation"),
+            "lighting_match": _avg(valid, "lighting_match"),
+            "detail_fidelity": _avg(valid, "detail_fidelity"),
             "instruction": instruction,
         })
 
