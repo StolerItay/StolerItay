@@ -162,6 +162,7 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
 
     # Try image-capable models in order; skip on 404 (removed) or unsupported 400.
     _image_gen_models = [
+        "gemini-2.0-flash-exp",
         "gemini-2.5-flash-image",
         "gemini-3.1-flash-image-preview",
     ]
@@ -172,7 +173,7 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
             print(f"[Gemini image-gen] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
-            if r.status_code in (404, 400):
+            if r.status_code in (404, 400, 403):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
             r.raise_for_status()
@@ -311,6 +312,7 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     }
 
     _image_gen_models = [
+        "gemini-2.0-flash-exp",
         "gemini-2.5-flash-image",
         "gemini-3.1-flash-image-preview",
     ]
@@ -321,7 +323,7 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
             print(f"[Gemini update-render] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
-            if r.status_code in (404, 400):
+            if r.status_code in (404, 400, 403):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
             r.raise_for_status()
@@ -484,6 +486,7 @@ async def gemini_generate_render_three_image(
     }
 
     _image_gen_models = [
+        "gemini-2.0-flash-exp",
         "gemini-2.5-flash-image",
         "gemini-3.1-flash-image-preview",
     ]
@@ -494,7 +497,7 @@ async def gemini_generate_render_three_image(
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
             print(f"[Gemini 3-img direct] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
-            if r.status_code in (404, 400):
+            if r.status_code in (404, 400, 403):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
             r.raise_for_status()
@@ -604,6 +607,7 @@ async def gemini_new_angle(
     }
 
     _image_gen_models = [
+        "gemini-2.0-flash-exp",
         "gemini-2.5-flash-image",
         "gemini-3.1-flash-image-preview",
     ]
@@ -614,7 +618,7 @@ async def gemini_new_angle(
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
             print(f"[Gemini new-angle] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
-            if r.status_code in (404, 400):
+            if r.status_code in (404, 400, 403):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
             r.raise_for_status()
@@ -694,6 +698,7 @@ async def gemini_edit_region(
     }
 
     _image_gen_models = [
+        "gemini-2.0-flash-exp",
         "gemini-2.5-flash-image",
         "gemini-3.1-flash-image-preview",
     ]
@@ -704,7 +709,7 @@ async def gemini_edit_region(
         async with httpx.AsyncClient(timeout=120) as http:
             r = await http.post(_url, json=payload)
             print(f"[Gemini edit-region] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
-            if r.status_code in (404, 400):
+            if r.status_code in (404, 400, 403):
                 _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
                 continue
             r.raise_for_status()
