@@ -113,6 +113,47 @@ def get_gemini_key() -> str:
     return os.getenv("GEMINI_API_KEY", "")
 
 
+# Maximum pixel dimension sent to Gemini. Images larger than this are resized
+# proportionally before base64-encoding. Larger images cause Gemini API timeouts.
+_GEMINI_MAX_PX = 1536
+
+
+def _resize_for_gemini(source: "Path | bytes", is_render: bool = False) -> tuple[bytes, str]:
+    """Return (image_bytes, mime_type) resized so the longest side ≤ _GEMINI_MAX_PX.
+
+    Renders (photos) are re-encoded as JPEG (quality=90) for smaller payloads.
+    Mass models (diagrams) are kept as PNG to preserve clean edges.
+    If the image is already within the limit it is returned as-is (original bytes).
+    """
+    raw = source if isinstance(source, bytes) else source.read_bytes()
+    try:
+        img = _PILImage.open(io.BytesIO(raw))
+        w, h = img.size
+        if max(w, h) > _GEMINI_MAX_PX:
+            ratio = _GEMINI_MAX_PX / max(w, h)
+            new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+            img = img.resize((new_w, new_h), _PILImage.LANCZOS)
+            print(f"  [resize] {w}×{h} → {new_w}×{new_h}", flush=True)
+        buf = io.BytesIO()
+        if is_render:
+            img.convert("RGB").save(buf, format="JPEG", quality=90)
+            return buf.getvalue(), "image/jpeg"
+        else:
+            img.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+    except Exception:
+        # Fall back to raw bytes if PIL fails
+        suffix = (source.suffix.lower() if isinstance(source, Path) else "")
+        mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+        return raw, mime
+
+
+def _b64_for_gemini(source: "Path | bytes", is_render: bool = False) -> tuple[str, str]:
+    """Convenience wrapper: resize → base64 encode → return (b64_str, mime_type)."""
+    img_bytes, mime = _resize_for_gemini(source, is_render=is_render)
+    return base64.b64encode(img_bytes).decode(), mime
+
+
 def _crop_mass_to_content(mass_path: Path) -> bytes:
     """Crop white/transparent padding from a mass model image so the geometry fills the frame.
 
@@ -208,15 +249,10 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
     # Use original mass (uncropped) for generation — the mass is already positioned at the exact
     # scale and location the building occupies in the render scene; cropping would destroy that.
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(reference_path, is_render=True)
 
     # For geometry extraction, crop to content so the text model can read details clearly,
     # but the original (uncropped) mass is what gets sent to the image generator.
@@ -305,13 +341,8 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("analyzer_instruction", (
         "You are a senior architectural visualization director. "
@@ -413,18 +444,12 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
     # Erase the old building from the render so Gemini cannot copy it
     clean_render_bytes = _erase_building_from_render(mass_path, render_path)
 
     # Original mass is sent to the generator (preserves scale/position in the scene)
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64 = base64.b64encode(clean_render_bytes).decode()
-    ref_mime = "image/png"
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(clean_render_bytes, is_render=True)
 
     # Crop for geometry extraction only (text model reads fine-detail better without white padding)
     cropped_for_extraction = _crop_mass_to_content(mass_path)
@@ -522,13 +547,20 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(render_path, is_render=True)
 
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(render_path)
+    # Extract geometry contract from the mass so the placement prompt can enforce exact proportions
+    cropped_for_extraction = _crop_mass_to_content(mass_path)
+    geometry_contract = await _extract_mass_geometry(mass_path, key, cropped_for_extraction)
+    geometry_section = ""
+    if geometry_contract:
+        geometry_section = (
+            "\n\nGEOMETRY CONTRACT — these proportions are ABSOLUTE CONSTRAINTS for the placed mass:\n"
+            f"{geometry_contract}\n"
+            "Every tower height ratio, silhouette feature, crown shape, and podium form listed above "
+            "MUST appear correctly in your output. Do NOT rescale, simplify, or omit any element.\n"
+        )
 
     instruction = (
         "You are an architectural visualization assistant. "
@@ -550,8 +582,9 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path
         "and infrastructure in Image 2.\n"
         "5. Do NOT apply photorealistic materials, textures, windows, or facade details — "
         "output a clean massing/volume diagram: flat white or light grey solid forms.\n"
-        "6. Do NOT add shadows or atmospheric effects to the mass — keep it as a neutral clean volume.\n\n"
-        "Output: the scene from Image 2 with the clean mass from Image 1 placed on site. "
+        "6. Do NOT add shadows or atmospheric effects to the mass — keep it as a neutral clean volume.\n"
+        + geometry_section +
+        "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
         "No text, no annotations."
     )
 
@@ -656,14 +689,9 @@ async def gemini_25_analyze_three_image(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    orig_b64, orig_mime = _b64(original_mass_path)
-    mod_b64, mod_mime = _b64(modified_mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    orig_b64, orig_mime = _b64_for_gemini(original_mass_path, is_render=False)
+    mod_b64,  mod_mime  = _b64_for_gemini(modified_mass_path, is_render=False)
+    ref_b64,  ref_mime  = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("analyzer_three_image_instruction", (
         "You are a senior architectural visualization director. "
@@ -729,14 +757,9 @@ async def gemini_generate_render_three_image(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    orig_b64, orig_mime = _b64(original_mass_path)
-    mod_b64, mod_mime = _b64(modified_mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    orig_b64, orig_mime = _b64_for_gemini(original_mass_path, is_render=False)
+    mod_b64,  mod_mime  = _b64_for_gemini(modified_mass_path, is_render=False)
+    ref_b64,  ref_mime  = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("direct_render_three_image_instruction", (
         "You are an expert architectural visualization artist. "
@@ -846,12 +869,7 @@ async def gemini_new_angle(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    render_b64, render_mime = _b64(render_path)
+    render_b64, render_mime = _b64_for_gemini(render_path, is_render=True)
 
     angle_part = angle_prompt.strip() if angle_prompt.strip() else "a compelling new viewpoint"
     style_part = (
