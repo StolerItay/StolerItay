@@ -41,6 +41,9 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+# Google Drive uploader (optional — only loaded if --drive-folder is given)
+_DriveUploader = None
+
 try:
     import httpx
 except ImportError:
@@ -408,6 +411,8 @@ async def run_iteration(
     key: str,
     output_dir: Path,
     iteration: int,
+    drive=None,
+    drive_folder_id: Optional[str] = None,
 ) -> tuple[list[dict], list[Optional[bytes]]]:
     scores: list[dict] = []
     images: list[Optional[bytes]] = []
@@ -425,6 +430,13 @@ async def run_iteration(
 
         out_path = output_dir / f"iter{iteration:02d}_{name}.png"
         out_path.write_bytes(img)
+
+        if drive and drive_folder_id:
+            try:
+                link = drive.upload_file(out_path, drive_folder_id)
+                print(f"  [Drive] {out_path.name} → {link}", flush=True)
+            except Exception as exc:
+                print(f"  [Drive] upload failed for {out_path.name}: {exc}", flush=True)
 
         print(f"  Judging  [{name}] ...", flush=True)
         try:
@@ -480,6 +492,15 @@ async def main_async() -> None:
         "--key", default=None,
         help="Gemini API key (default: GEMINI_API_KEY env var)",
     )
+    parser.add_argument(
+        "--drive-folder", default=None,
+        help="Google Drive folder ID to upload results into",
+    )
+    parser.add_argument(
+        "--drive-credentials", default=None,
+        help="Path to Google service account JSON credentials file "
+             "(default: GOOGLE_APPLICATION_CREDENTIALS env var)",
+    )
     args = parser.parse_args()
 
     server = args.server.rstrip("/")
@@ -493,9 +514,32 @@ async def main_async() -> None:
         print(f"ERROR: --folder is not a directory: {args.folder}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = args.output_dir or (BASE_DIR / "opt_runs" / str(uuid.uuid4())[:8])
+    run_id = str(uuid.uuid4())[:8]
+    output_dir = args.output_dir or (BASE_DIR / "opt_runs" / run_id)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output dir: {output_dir}\n")
+    print(f"Output dir: {output_dir}")
+
+    # ── Google Drive setup (optional) ─────────────────────────────────────────
+    drive: Optional[object] = None
+    drive_run_folder_id: Optional[str] = None
+    if args.drive_folder:
+        creds_path = args.drive_credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if not creds_path:
+            print(
+                "WARNING: --drive-folder given but no credentials found.\n"
+                "Pass --drive-credentials or set GOOGLE_APPLICATION_CREDENTIALS.",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                from drive_upload import DriveUploader
+                drive = DriveUploader(creds_path, args.drive_folder)
+                drive_run_folder_id = drive.create_run_folder(run_id)
+                print(f"Drive folder   : {args.drive_folder} / {run_id}")
+            except Exception as exc:
+                print(f"WARNING: Drive setup failed: {exc}", file=sys.stderr)
+                drive = None
+    print()
 
     # Find triplets
     print("Scanning for triplets (mass + render + result)...")
@@ -533,7 +577,10 @@ async def main_async() -> None:
     for iteration in range(1, args.iterations + 1):
         print(f"\n── Iteration {iteration}/{args.iterations} {'─' * 44}")
 
-        scores, _ = await run_iteration(triplets, tab, server, key, output_dir, iteration)
+        scores, _ = await run_iteration(
+            triplets, tab, server, key, output_dir, iteration,
+            drive=drive, drive_folder_id=drive_run_folder_id,
+        )
         valid = [s for s in scores if s]
 
         if not valid:
@@ -567,7 +614,8 @@ async def main_async() -> None:
             save_prompt_config(config)
 
         # Save per-iteration scores
-        (output_dir / f"iter{iteration:02d}_scores.json").write_text(
+        scores_path = output_dir / f"iter{iteration:02d}_scores.json"
+        scores_path.write_text(
             json.dumps({
                 "iteration": iteration, "composite": cscore,
                 "cases": [{"name": t["name"], "scores": s} for t, s in zip(triplets, scores)],
@@ -575,6 +623,11 @@ async def main_async() -> None:
             }, indent=2),
             encoding="utf-8",
         )
+        if drive and drive_run_folder_id:
+            try:
+                drive.upload_file(scores_path, drive_run_folder_id)
+            except Exception as exc:
+                print(f"  [Drive] scores upload failed: {exc}", flush=True)
 
         # Generate improved instruction for next iteration
         if iteration < args.iterations:
@@ -591,10 +644,20 @@ async def main_async() -> None:
     print(f"Best score     : {best_score:.2f}/10")
 
     # Save history
-    (output_dir / "optimization_history.json").write_text(
-        json.dumps(history, indent=2, default=str), encoding="utf-8"
-    )
-    print(f"History saved  : {output_dir / 'optimization_history.json'}")
+    history_path = output_dir / "optimization_history.json"
+    history_path.write_text(json.dumps(history, indent=2, default=str), encoding="utf-8")
+    print(f"History saved  : {history_path}")
+
+    # Upload final files to Drive
+    if drive and drive_run_folder_id:
+        for final_path in [history_path, PROMPT_CONFIG_PATH]:
+            if final_path.exists():
+                try:
+                    link = drive.upload_file(final_path, drive_run_folder_id)
+                    print(f"[Drive] {final_path.name} → {link}")
+                except Exception as exc:
+                    print(f"[Drive] upload failed for {final_path.name}: {exc}", file=sys.stderr)
+
     print("\nDone! The optimized prompts are already in prompt_config.json.")
     print("The running server picks them up on the next request (no restart needed).")
 

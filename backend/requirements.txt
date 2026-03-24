@@ -5,3 +5,5 @@ pillow>=11.1.0
 python-dotenv==1.0.1
 aiofiles==24.1.0
 httpx
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
