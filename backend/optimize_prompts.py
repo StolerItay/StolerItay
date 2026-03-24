@@ -71,20 +71,31 @@ DEFAULTS: dict[str, str] = {
         "You are an expert architectural visualization artist. "
         "Image 1 is a new architectural mass/volume model — the EXACT geometric blueprint for a new building. "
         "Image 2 is an existing photorealistic render of a site whose building will be replaced.\n\n"
-        "CRITICAL — TASK: Replace the building in Image 2 with the new building defined by Image 1. "
-        "The result must look like the new building was ALWAYS PART OF THE SCENE in Image 2.\n\n"
-        "GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
-        "- SILHOUETTE: Reproduce the EXACT outer silhouette of Image 1 — do not alter height, width, or outline.\n"
-        "- HEIGHT: Tower height is a fixed constraint. Do NOT compress, elongate, or rescale vertically.\n"
-        "- PROPORTIONS: Width-to-height ratio must match Image 1 exactly.\n"
-        "- Preserve every feature: crown shape, podium, setbacks, connecting elements, lattice structures.\n"
-        "- Do NOT simplify, redesign, or 'improve' any aspect of the geometry from Image 1.\n\n"
-        "SCENE INTEGRATION (from Image 2):\n"
-        "- Match the camera angle, perspective, and focal length of Image 2 EXACTLY.\n"
-        "- Preserve ALL surrounding elements unchanged: sky, roads, vegetation, other buildings, infrastructure.\n"
-        "- Match the lighting direction, quality, and color temperature of Image 2.\n"
-        "- The new building must cast shadows consistent with Image 2's sun angle and atmosphere.\n"
-        "- Adapt facade materials to look photorealistic within Image 2's environmental context.\n"
+        "STEP 1 — STUDY Image 1 carefully before generating anything:\n"
+        "- Count every distinct volume, tower, and mass block.\n"
+        "- Note the exact overall silhouette from base to crown.\n"
+        "- Identify every architectural element: setbacks, fins, sky bridges, balcony lines, "
+        "floor plates, podium shape, canopy, lattice, crown geometry.\n"
+        "- Memorize the width-to-height ratio of every volume.\n\n"
+        "STEP 2 — REPLACE the building in Image 2 with EXACTLY what you studied in Step 1.\n\n"
+        "SHAPE RULES — ABSOLUTE, NON-NEGOTIABLE:\n"
+        "- THE OVERALL 3-D MASSING ENVELOPE MUST BE IDENTICAL TO IMAGE 1. "
+        "Do not simplify, round off, or generalize the shape.\n"
+        "- EVERY VOLUME must be present: same count, same relative position, same proportions.\n"
+        "- HEIGHT IS FIXED. Do NOT compress, elongate, or rescale any volume vertically.\n"
+        "- THE OUTER SILHOUETTE (top profile, crown, sides) must match Image 1 exactly — "
+        "pixel for pixel in composition.\n\n"
+        "ARCHITECTURAL ELEMENTS — REPRODUCE ALL OF THEM:\n"
+        "- Crown / top termination: reproduce the exact shape, cutouts, fins, or taper.\n"
+        "- Setbacks: every step-back in the massing must appear at the correct floor level.\n"
+        "- Podium / base: exact footprint, curved or straight edges, canopy or lattice if present.\n"
+        "- Connecting elements: sky bridges, structural links — keep them where Image 1 shows them.\n"
+        "- Facade grid: floor lines, balcony rails, structural bays — maintain their rhythm and density.\n"
+        "- DO NOT omit, merge, smooth, or 'improve' any element. If it is in Image 1, it must appear.\n\n"
+        "SCENE INTEGRATION (from Image 2 — already good, keep it):\n"
+        "- Preserve camera angle, perspective, and all surroundings exactly.\n"
+        "- Match lighting, shadows, and atmosphere of Image 2.\n"
+        "- Apply photorealistic facade materials appropriate to the scene.\n"
         "Output only the rendered image, no text."
     ),
     "direct_render_instruction": (
@@ -253,26 +264,29 @@ async def gemini_judge(
         "- Image 2: expected photorealistic result (ground truth target)\n"
         "- Image 3: AI-generated output to evaluate\n\n"
         "Score Image 3 on EACH criterion (integer 0-10):\n"
-        "  geometry_fidelity    — Does Image 3 match Image 1's silhouette, tower count, and proportions?\n"
-        "  height_preservation  — Are each tower's heights preserved exactly from Image 1?\n"
-        "  style_quality        — Does Image 3 match Image 2's materials, textures, and facade details?\n"
-        "  scene_integration    — Does the new building look like it naturally belongs in the scene? "
-        "Are edges, perspective, and scale seamless with the surroundings?\n"
+        "  overall_shape        — MOST CRITICAL. Does the complete 3-D silhouette of the building "
+        "in Image 3 match Image 1 EXACTLY? Same number of volumes, same massing envelope, same "
+        "top profile, same width-to-height ratios. A completely wrong shape scores 0.\n"
+        "  height_preservation  — Are every tower/volume height preserved exactly from Image 1? "
+        "Compressed, stretched, or rescaled volumes score 0.\n"
+        "  architectural_elements — Are ALL specific architectural features from Image 1 present and "
+        "correctly reproduced: crown details, podium, setbacks, fins, sky bridges, balcony lines, "
+        "floor plates, structural grid, canopy, lattice? Missing or simplified elements score 0.\n"
+        "  style_quality        — Does Image 3 match Image 2's materials, glass type, facade texture, "
+        "and color palette?\n"
+        "  scene_integration    — Does the building blend naturally into the scene: correct scale, "
+        "seamless edges, consistent perspective?\n"
         "  context_preservation — Are ALL surrounding elements from Image 2 unchanged: sky, roads, "
-        "vegetation, adjacent buildings, ground, infrastructure?\n"
-        "  lighting_match       — Does the building's lighting, shadows, and color temperature match "
-        "the scene's sun direction and atmosphere from Image 2?\n"
-        "  detail_fidelity      — Are architectural details correctly rendered: windows, floor lines, "
-        "balconies, facade panels, structural elements?\n"
-        "  overall_quality      — Overall photorealism and visual quality of Image 3 vs Image 2.\n\n"
+        "vegetation, adjacent buildings, ground?\n"
+        "  lighting_match       — Does lighting direction, shadow, and color temperature match Image 2?\n\n"
         "Also provide:\n"
-        "  issues         — top 3 specific problems (geometry errors, integration artifacts, missing details)\n"
-        "  geometry_delta — describe exactly how Image 3's geometry differs from Image 1\n\n"
+        "  issues         — top 3 specific problems; always start with shape/element failures if any\n"
+        "  geometry_delta — describe EXACTLY how Image 3's overall shape differs from Image 1 "
+        "(mention every volume that is wrong, missing, or distorted)\n\n"
         "Return ONLY valid JSON (no markdown, no extra text):\n"
-        '{"geometry_fidelity":0,"height_preservation":0,"style_quality":0,'
-        '"scene_integration":0,"context_preservation":0,"lighting_match":0,'
-        '"detail_fidelity":0,"overall_quality":0,'
-        '"issues":["","",""],"geometry_delta":""}'
+        '{"overall_shape":0,"height_preservation":0,"architectural_elements":0,'
+        '"style_quality":0,"scene_integration":0,"context_preservation":0,'
+        '"lighting_match":0,"issues":["","",""],"geometry_delta":""}'
     )
 
     payload = {
@@ -331,12 +345,19 @@ async def gemini_optimize(
         "---\n" + current_instruction + "\n---\n\n"
         "AGGREGATED TEST FAILURES:\n"
         "---\n" + feedback + "\n---\n\n"
-        "Write an IMPROVED instruction. Focus especially on:\n"
-        "1. Geometry and silhouette preservation — this is the hardest constraint for image models.\n"
-        "2. Height fidelity — towers must not be compressed, stretched, or rescaled.\n"
-        "3. Preventing the model from 'redesigning' the building.\n\n"
-        "Be very explicit, concrete, and commanding. Use ALL CAPS for the most critical constraints.\n"
-        "Focus especially on whichever criteria scored lowest in the test results above.\n"
+        "THE TWO KNOWN FAILURE MODES (fix these first):\n"
+        "1. OVERALL SHAPE — the model generates a generic or simplified building instead of "
+        "reproducing the exact 3-D massing from Image 1. Every volume, every setback, every "
+        "protrusion must match.\n"
+        "2. ARCHITECTURAL ELEMENTS — specific features (crown details, fins, sky bridges, podium, "
+        "balcony lines, floor plates, lattice, canopy) are omitted or smoothed away. "
+        "These must be reproduced one-by-one.\n\n"
+        "Write an IMPROVED instruction that forces the model to:\n"
+        "- Study the mass model volume-by-volume before generating anything.\n"
+        "- Reproduce every architectural element explicitly — no simplification allowed.\n"
+        "- Treat the mass model as a hard constraint, not a suggestion.\n\n"
+        "Note: atmosphere, camera angle, and landscape are already good — do NOT over-specify them.\n\n"
+        "Be commanding. Use ALL CAPS for shape and element constraints.\n"
         "Return ONLY the new instruction text — no explanation, no markdown, no preamble."
     )
 
@@ -378,18 +399,19 @@ def _avg(scores: list[dict], key: str) -> float:
 
 
 def composite_score(scores: list[dict]) -> float:
-    """Weighted composite:
-    geometry 25% + height 20% + style 15% + scene_integration 15%
-    + context_preservation 10% + lighting_match 8% + detail_fidelity 7%
+    """Weighted composite (shape-first — reflects known failure mode):
+    overall_shape 35% + height_preservation 20% + architectural_elements 25%
+    + style_quality 10% + scene_integration 5% + context_preservation 3%
+    + lighting_match 2%
     """
     return (
-        0.25 * _avg(scores, "geometry_fidelity")
+        0.35 * _avg(scores, "overall_shape")
+        + 0.25 * _avg(scores, "architectural_elements")
         + 0.20 * _avg(scores, "height_preservation")
-        + 0.15 * _avg(scores, "style_quality")
-        + 0.15 * _avg(scores, "scene_integration")
-        + 0.10 * _avg(scores, "context_preservation")
-        + 0.08 * _avg(scores, "lighting_match")
-        + 0.07 * _avg(scores, "detail_fidelity")
+        + 0.10 * _avg(scores, "style_quality")
+        + 0.05 * _avg(scores, "scene_integration")
+        + 0.03 * _avg(scores, "context_preservation")
+        + 0.02 * _avg(scores, "lighting_match")
     )
 
 
@@ -400,14 +422,13 @@ def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
             continue
         lines.append(
             f"[{name}] "
-            f"geometry={score.get('geometry_fidelity','?')}/10 "
+            f"shape={score.get('overall_shape','?')}/10 "
+            f"arch_elements={score.get('architectural_elements','?')}/10 "
             f"height={score.get('height_preservation','?')}/10 "
             f"style={score.get('style_quality','?')}/10 "
-            f"scene_integration={score.get('scene_integration','?')}/10 "
-            f"context_preservation={score.get('context_preservation','?')}/10 "
-            f"lighting_match={score.get('lighting_match','?')}/10 "
-            f"detail_fidelity={score.get('detail_fidelity','?')}/10 "
-            f"overall={score.get('overall_quality','?')}/10"
+            f"scene={score.get('scene_integration','?')}/10 "
+            f"context={score.get('context_preservation','?')}/10 "
+            f"lighting={score.get('lighting_match','?')}/10"
         )
         for issue in (score.get("issues") or [])[:2]:
             lines.append(f"  issue: {issue}")
@@ -416,14 +437,13 @@ def build_feedback_summary(scores: list[dict], names: list[str]) -> str:
             lines.append(f"  geometry_delta: {delta[:250]}")
     lines.append(
         f"\nAverages across {len(scores)} case(s): "
-        f"geometry={_avg(scores,'geometry_fidelity'):.1f} "
+        f"shape={_avg(scores,'overall_shape'):.1f} "
+        f"arch_elements={_avg(scores,'architectural_elements'):.1f} "
         f"height={_avg(scores,'height_preservation'):.1f} "
         f"style={_avg(scores,'style_quality'):.1f} "
-        f"scene_integration={_avg(scores,'scene_integration'):.1f} "
-        f"context_preservation={_avg(scores,'context_preservation'):.1f} "
-        f"lighting_match={_avg(scores,'lighting_match'):.1f} "
-        f"detail_fidelity={_avg(scores,'detail_fidelity'):.1f} "
-        f"overall={_avg(scores,'overall_quality'):.1f}"
+        f"scene={_avg(scores,'scene_integration'):.1f} "
+        f"context={_avg(scores,'context_preservation'):.1f} "
+        f"lighting={_avg(scores,'lighting_match'):.1f}"
     )
     return "\n".join(lines)
 
@@ -469,13 +489,13 @@ async def run_iteration(
             score = await gemini_judge(triplet["mass"], triplet["result"], img, key)
             scores.append(score)
             print(
-                f"  [{name}] geometry={score.get('geometry_fidelity','?')} "
+                f"  [{name}] shape={score.get('overall_shape','?')} "
+                f"arch={score.get('architectural_elements','?')} "
                 f"height={score.get('height_preservation','?')} "
                 f"style={score.get('style_quality','?')} "
                 f"scene={score.get('scene_integration','?')} "
                 f"context={score.get('context_preservation','?')} "
-                f"lighting={score.get('lighting_match','?')} "
-                f"detail={score.get('detail_fidelity','?')}",
+                f"lighting={score.get('lighting_match','?')}",
                 flush=True,
             )
         except Exception as exc:
@@ -624,24 +644,24 @@ async def main_async() -> None:
         feedback = build_feedback_summary(valid, valid_names)
 
         print(f"\n  Composite score: {cscore:.2f}/10  "
-              f"(geometry={_avg(valid,'geometry_fidelity'):.1f} "
+              f"(shape={_avg(valid,'overall_shape'):.1f} "
+              f"arch={_avg(valid,'architectural_elements'):.1f} "
               f"height={_avg(valid,'height_preservation'):.1f} "
               f"style={_avg(valid,'style_quality'):.1f} "
               f"scene={_avg(valid,'scene_integration'):.1f} "
               f"context={_avg(valid,'context_preservation'):.1f} "
-              f"lighting={_avg(valid,'lighting_match'):.1f} "
-              f"detail={_avg(valid,'detail_fidelity'):.1f})")
+              f"lighting={_avg(valid,'lighting_match'):.1f})")
 
         history.append({
             "iteration": iteration,
             "composite": cscore,
-            "geometry": _avg(valid, "geometry_fidelity"),
+            "overall_shape": _avg(valid, "overall_shape"),
+            "architectural_elements": _avg(valid, "architectural_elements"),
             "height": _avg(valid, "height_preservation"),
             "style": _avg(valid, "style_quality"),
             "scene_integration": _avg(valid, "scene_integration"),
             "context_preservation": _avg(valid, "context_preservation"),
             "lighting_match": _avg(valid, "lighting_match"),
-            "detail_fidelity": _avg(valid, "detail_fidelity"),
             "instruction": instruction,
         })
 
