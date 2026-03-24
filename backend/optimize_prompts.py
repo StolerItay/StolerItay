@@ -494,7 +494,8 @@ async def main_async() -> None:
     )
     parser.add_argument(
         "--drive-folder", default=None,
-        help="Google Drive folder ID to upload results into",
+        help="Google Drive folder ID to upload results into "
+             "(default: GOOGLE_DRIVE_FOLDER_ID env var)",
     )
     parser.add_argument(
         "--drive-credentials", default=None,
@@ -522,7 +523,8 @@ async def main_async() -> None:
     # ── Google Drive setup (optional) ─────────────────────────────────────────
     drive: Optional[object] = None
     drive_run_folder_id: Optional[str] = None
-    if args.drive_folder:
+    drive_folder_id = args.drive_folder or os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+    if drive_folder_id:
         creds_path = args.drive_credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
         if not creds_path:
             print(
@@ -533,9 +535,9 @@ async def main_async() -> None:
         else:
             try:
                 from drive_upload import DriveUploader
-                drive = DriveUploader(creds_path, args.drive_folder)
+                drive = DriveUploader(drive_folder_id, creds_path)
                 drive_run_folder_id = drive.create_run_folder(run_id)
-                print(f"Drive folder   : {args.drive_folder} / {run_id}")
+                print(f"Drive folder   : {drive_folder_id} / {run_id}")
             except Exception as exc:
                 print(f"WARNING: Drive setup failed: {exc}", file=sys.stderr)
                 drive = None
