@@ -38,7 +38,7 @@ contains "--mass" is the wireframe/massing model; the one containing
 
 Output
 ------
-  Results printed to terminal and saved to paired_test_summary_<id>.json.
+  Results printed to terminal and saved to opt_runs/<folder_name>/paired_test_summary_<id>.json.
 """
 
 import argparse
@@ -290,7 +290,12 @@ def main() -> None:
 
         # ── Save JSON ─────────────────────────────────────────────────────────
         run_id = str(uuid.uuid4())[:8]
-        out_path = args.output or Path(f"paired_test_summary_{run_id}.json")
+        if args.output:
+            out_path = args.output
+        else:
+            opt_runs_dir = Path("opt_runs") / args.folder.name
+            opt_runs_dir.mkdir(parents=True, exist_ok=True)
+            out_path = opt_runs_dir / f"paired_test_summary_{run_id}.json"
         out_path.write_text(json.dumps(job_entries, indent=2, default=str))
         print(f"\nFull results saved to: {out_path}")
 
