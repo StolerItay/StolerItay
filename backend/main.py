@@ -507,6 +507,132 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
+async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path:
+    """Stage 1 of the staged pipeline.
+
+    Ask Gemini's image-gen model to take the mass/wireframe model and place it
+    cleanly into the background scene at the correct position, scale, and
+    perspective — outputting a clean massing diagram in the scene rather than
+    a fully rendered image.
+
+    The output is used as a better "mass" input for Stage 2, because the
+    geometry is already seated in the correct spatial context.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    def _b64(p: Path) -> tuple[str, str]:
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        return base64.b64encode(p.read_bytes()).decode(), mime
+
+    mass_b64, mass_mime = _b64(mass_path)
+    ref_b64, ref_mime = _b64(render_path)
+
+    instruction = (
+        "You are an architectural visualization assistant. "
+        "Image 1 is a new building massing model — a wireframe/volume diagram that defines the EXACT geometry "
+        "(tower count, heights, silhouette, crown shapes, podium) of a new building. "
+        "Image 2 is a photorealistic aerial render of an urban scene with an existing building on site.\n\n"
+        "TASK: Produce a composite image that shows Image 2's background with Image 1's building mass "
+        "placed at EXACTLY the correct position, scale, and perspective in the scene — replacing the "
+        "existing building footprint.\n\n"
+        "PLACEMENT RULES (strictly enforced):\n"
+        "1. Keep EVERYTHING in Image 2 UNCHANGED except the building area — sky, roads, trees, surrounding "
+        "buildings, ground plane, and all infrastructure must remain pixel-perfect.\n"
+        "2. Place Image 1's mass as a clean white/light-grey volume silhouette at the site — "
+        "match the camera perspective and focal length of Image 2 exactly so the base sits on "
+        "the correct ground plane with proper foreshortening.\n"
+        "3. Preserve ALL geometry from Image 1: exact number of towers, relative heights, "
+        "crown shapes, podium form, connecting elements — do not simplify or alter any feature.\n"
+        "4. The building size in the output must be consistent with the scale of surrounding buildings "
+        "and infrastructure in Image 2.\n"
+        "5. Do NOT apply photorealistic materials, textures, windows, or facade details — "
+        "output a clean massing/volume diagram: flat white or light grey solid forms.\n"
+        "6. Do NOT add shadows or atmospheric effects to the mass — keep it as a neutral clean volume.\n\n"
+        "Output: the scene from Image 2 with the clean mass from Image 1 placed on site. "
+        "No text, no annotations."
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": instruction},
+            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+            {"inline_data": {"mime_type": ref_mime,  "data": ref_b64}},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.0-flash-exp",
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini place-mass stage-1] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400, 403):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"Stage-1 placement: no Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            placed_path = UPLOADS_DIR / f"placed_{uuid.uuid4().hex}.png"
+            placed_path.write_bytes(img_bytes)
+            return placed_path
+
+    raise ValueError(f"Stage-1 placement: Gemini returned no image. Response: {data}")
+
+
+async def gemini_staged_update_render(
+    mass_path: Path,
+    render_path: Path,
+    prompt: str = "",
+    analyzer_model: str = "gemini-2.5-pro",
+) -> Path:
+    """Two-stage update-render pipeline.
+
+    Stage 1 — Placement: gemini_place_mass_in_scene
+        Positions the mass model cleanly in the scene at the correct perspective
+        and scale. Background is untouched; building is a clean volume diagram.
+
+    Stage 2 — Render: gemini_25_render (analyzer → image-gen)
+        Takes the placed mass as its geometry input and the original render
+        (with old building erased) as the style/scene reference. Because the
+        mass is already correctly seated in the scene, the generator only needs
+        to apply materials and lighting — not solve placement simultaneously.
+    """
+    print("[staged] Stage 1: placing mass in scene…", flush=True)
+    placed_mass_path = await gemini_place_mass_in_scene(mass_path, render_path)
+    try:
+        # Erase old building from render so stage-2 uses only scene context
+        clean_render_path = UPLOADS_DIR / f"clean_{uuid.uuid4().hex}.png"
+        clean_render_path.write_bytes(_erase_building_from_render(mass_path, render_path))
+        print("[staged] Stage 2: rendering placed mass…", flush=True)
+        try:
+            out_path = await gemini_25_render(
+                placed_mass_path, clean_render_path, prompt, analyzer_model=analyzer_model
+            )
+        finally:
+            clean_render_path.unlink(missing_ok=True)
+        return out_path
+    finally:
+        placed_mass_path.unlink(missing_ok=True)
+
+
 async def gemini_25_analyze_three_image(
     original_mass_path: Path,
     modified_mass_path: Path,
@@ -1037,6 +1163,12 @@ async def run_controlnet_render(
         elif model == "gemini-direct":
             # gemini_generate_render_update does its own erasing internally
             out_path = await gemini_generate_render_update(mass_path, render_path, prompt)
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+        elif model in ("gemini-staged-pro", "gemini-staged-flash"):
+            # Two-stage pipeline: place mass in scene first, then render
+            analyzer = "gemini-2.5-pro" if model == "gemini-staged-pro" else "gemini-2.5-flash"
+            out_path = await gemini_staged_update_render(mass_path, render_path, prompt, analyzer_model=analyzer)
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
 

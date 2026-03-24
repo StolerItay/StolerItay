@@ -54,7 +54,7 @@ except ImportError:
     print("httpx not installed. Run: pip install httpx", file=sys.stderr)
     sys.exit(1)
 
-GEMINI_MODELS = ["gemini-25-pro", "gemini-25-flash", "gemini-direct"]
+GEMINI_MODELS = ["gemini-25-pro", "gemini-25-flash", "gemini-direct", "gemini-staged-pro", "gemini-staged-flash"]
 TABS = ["style-transfer", "update-render"]
 ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 POLL_INTERVAL = 5  # seconds between status polls
@@ -324,9 +324,11 @@ def main() -> None:
         sys.exit(1)
 
     MODEL_SHORT = {
-        "gemini-25-pro":   "pro",
-        "gemini-25-flash": "flash",
-        "gemini-direct":   "direct",
+        "gemini-25-pro":      "pro",
+        "gemini-25-flash":    "flash",
+        "gemini-direct":      "direct",
+        "gemini-staged-pro":  "staged-pro",
+        "gemini-staged-flash":"staged-flash",
     }
 
     with httpx.Client() as client:
