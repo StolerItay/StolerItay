@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import io
 import httpx
+from PIL import Image as _PILImage
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -111,6 +113,95 @@ def get_gemini_key() -> str:
     return os.getenv("GEMINI_API_KEY", "")
 
 
+def _crop_mass_to_content(mass_path: Path) -> bytes:
+    """Crop white/transparent padding from a mass model image so the geometry fills the frame.
+
+    Returns PNG bytes of the cropped+padded image. If cropping fails for any reason
+    the original file bytes are returned unchanged.
+    """
+    try:
+        img = _PILImage.open(mass_path).convert("RGBA")
+        r, g, b, a = img.split()
+        # Build a mask of non-white, non-transparent pixels
+        rgb = _PILImage.merge("RGB", (r, g, b))
+        diff = _PILImage.new("RGB", img.size, (255, 255, 255))
+        from PIL import ImageChops, ImageFilter
+        delta = ImageChops.difference(rgb, diff)
+        # Threshold: any pixel that differs from white by > 15 in any channel
+        mask = delta.convert("L").point(lambda x: 255 if x > 15 else 0)
+        # Also consider alpha — non-transparent pixels count
+        alpha_mask = a.point(lambda x: 255 if x > 30 else 0)
+        from PIL import ImageOps
+        combined = _PILImage.new("L", img.size, 0)
+        combined.paste(mask, mask=mask)
+        combined.paste(alpha_mask, mask=alpha_mask)
+        bbox = combined.getbbox()
+        if bbox is None:
+            return mass_path.read_bytes()
+        # Add 5% padding around the content
+        w, h = img.size
+        pad_x = max(int((bbox[2] - bbox[0]) * 0.05), 10)
+        pad_y = max(int((bbox[3] - bbox[1]) * 0.05), 10)
+        x0 = max(bbox[0] - pad_x, 0)
+        y0 = max(bbox[1] - pad_y, 0)
+        x1 = min(bbox[2] + pad_x, w)
+        y1 = min(bbox[3] + pad_y, h)
+        cropped = img.crop((x0, y0, x1, y1)).convert("RGB")
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return mass_path.read_bytes()
+
+
+async def _extract_mass_geometry(mass_path: Path, key: str, cropped_bytes: bytes) -> str:
+    """Call Gemini text model to extract a structured geometry description from the mass model.
+
+    Returns a plain-text geometry contract that can be injected into generation prompts.
+    """
+    mass_b64 = base64.b64encode(cropped_bytes).decode()
+    prompt = (
+        "You are analyzing an architectural mass/wireframe model image.\n"
+        "Extract a precise geometry description covering ALL of the following — be specific and quantitative:\n\n"
+        "1. TOWER COUNT: exact number of distinct vertical volumes/towers visible\n"
+        "2. TOWER HEIGHTS: express each tower's height as a percentage of the tallest tower "
+        "(e.g. 'Tower A: 100%, Tower B: 65%, Tower C: 58%')\n"
+        "3. TOWER SHAPES: describe the cross-section and profile of each tower "
+        "(e.g. 'cylindrical', 'rectangular with chamfered corners', 'curved blade', "
+        "'stacked segmented volumes', 'organic tapering form')\n"
+        "4. SILHOUETTE: describe the overall outer silhouette as seen from this camera angle — "
+        "trace the top profile left to right\n"
+        "5. CROWN/TOP: exact top termination of each tower "
+        "(e.g. 'flat circular crown with gold rim', 'pointed blade', 'rounded top', 'forked peaks')\n"
+        "6. PODIUM/BASE: describe the base structure "
+        "(e.g. 'rectangular podium', 'organic curved lattice', 'woven rib structure', 'no podium')\n"
+        "7. DISTINCTIVE FEATURES: any unique elements "
+        "(e.g. 'horizontal banding every 4 floors', 'golden parametric ribs connecting towers', "
+        "'curved inward taper at mid-height', 'sky bridge at 60% height')\n"
+        "8. RELATIVE POSITIONS: spatial arrangement of towers "
+        "(e.g. 'left tower flanks right, central tower set back', 'two towers side by side')\n\n"
+        "Output ONLY the numbered list above, no preamble. Be concise but precise."
+    )
+    payload = {
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": mass_b64}},
+        ]}],
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60) as http:
+            r = await http.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        print(f"[mass geometry extraction failed: {e}]", flush=True)
+        return ""
+
+
 async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: str = "") -> Path:
     """Send mass + reference to Gemini 2.0 Flash image generation. Returns saved output path."""
     key = get_gemini_key()
@@ -122,32 +213,46 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
         mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
         return base64.b64encode(p.read_bytes()).decode(), mime
 
+    # Use original mass (uncropped) for generation — the mass is already positioned at the exact
+    # scale and location the building occupies in the render scene; cropping would destroy that.
     mass_b64, mass_mime = _b64(mass_path)
     ref_b64, ref_mime = _b64(reference_path)
 
-    instruction = _load_prompt("direct_render_instruction", (
+    # For geometry extraction, crop to content so the text model can read details clearly,
+    # but the original (uncropped) mass is what gets sent to the image generator.
+    cropped_for_extraction = _crop_mass_to_content(mass_path)
+    # Extract explicit geometry description from the mass model
+    geometry_contract = await _extract_mass_geometry(mass_path, key, cropped_for_extraction)
+    geometry_section = ""
+    if geometry_contract:
+        geometry_section = (
+            "\n\nGEOMETRY CONTRACT — extracted directly from Image 1. "
+            "Every detail below is a HARD CONSTRAINT. Do NOT deviate:\n"
+            f"{geometry_contract}\n"
+            "The output MUST match every point above exactly. "
+            "If any tower count, height ratio, silhouette feature, crown shape, or podium form "
+            "differs from the contract above, the output is WRONG.\n"
+        )
+
+    base_instruction = (
         "You are an expert architectural visualization artist. "
-        "The first image is an architectural mass/volume model — treat it as a strict geometric blueprint. "
-        "The second image is a reference architectural render showing the desired materials and style. "
-        "\n\nCRITICAL — GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
-        "- SILHOUETTE: The outer silhouette of the building must be PIXEL-IDENTICAL to Image 1. "
-        "Do not alter the boundary, outline, or overall form in any way.\n"
-        "- HEIGHT: The height of each tower is a fixed constraint. Do NOT compress, elongate, or "
-        "rescale any building vertically. Tower heights and their ratios must be preserved exactly.\n"
-        "- PROPORTIONS: Each tower's width-to-height ratio must match Image 1 exactly. "
-        "Do not make towers wider, narrower, taller, or shorter than shown.\n"
-        "- Reproduce the EXACT number of towers and their relative positions.\n"
-        "- Preserve the precise crown/top profile of every tower (shape, slant, cutouts, fins).\n"
-        "- Keep every connecting element: sky bridges, structural links, transitions between towers.\n"
-        "- Maintain the base/podium form: its footprint, curved elements, canopy, or lattice structure.\n"
-        "- Do NOT simplify, merge, add, smooth, or omit any architectural feature shown in the mass.\n"
-        "- This is a STYLE TRANSFER only — you are changing materials and lighting, NOT redesigning the building.\n"
-        "\nSTYLE (from Image 2 only): apply the facade materials, glass type and color, structural "
-        "finish, lighting, sky, vegetation, and overall atmosphere.\n"
+        "Image 1 is an architectural mass/volume model — the EXACT geometric blueprint. "
+        "Image 2 is a reference render showing the target materials and style ONLY.\n"
+        "\n⚠ GEOMETRY IS LOCKED TO IMAGE 1 — THIS IS NON-NEGOTIABLE:\n"
+        "- The complete 3-D silhouette, tower count, height ratios, crown shapes, podium form, "
+        "and every architectural element in Image 1 must appear UNCHANGED in the output.\n"
+        "- Do NOT normalize, simplify, smooth, redesign, or 'improve' any geometry.\n"
+        "- Do NOT compress or elongate any tower vertically.\n"
+        "- Do NOT merge separate volumes or add volumes that are not in Image 1.\n"
+        "- This is a STYLE TRANSFER only: change materials and lighting, NOT the building geometry.\n"
+        "\nSTYLE (from Image 2 only): facade materials, glass type, structural finish, "
+        "lighting, sky, vegetation, and atmosphere.\n"
         "Output only the rendered image, no text."
-    ))
+    )
+    instruction = _load_prompt("direct_render_instruction", base_instruction)
+    instruction += geometry_section
     if prompt.strip():
-        instruction += f" Additional direction: {prompt.strip()}"
+        instruction += f"\nAdditional direction: {prompt.strip()}"
 
     payload = {
         "contents": [{
@@ -276,21 +381,36 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
         mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
         return base64.b64encode(p.read_bytes()).decode(), mime
 
+    # Original mass is sent to the generator (preserves scale/position in the scene)
     mass_b64, mass_mime = _b64(mass_path)
     ref_b64, ref_mime = _b64(render_path)
 
-    instruction = _load_prompt("update_render_direct_instruction", (
+    # Crop for geometry extraction only (text model reads fine-detail better without white padding)
+    cropped_for_extraction = _crop_mass_to_content(mass_path)
+    geometry_contract = await _extract_mass_geometry(mass_path, key, cropped_for_extraction)
+    geometry_section = ""
+    if geometry_contract:
+        geometry_section = (
+            "\n\nGEOMETRY CONTRACT — extracted directly from Image 1. "
+            "Every detail below is a HARD CONSTRAINT. Do NOT deviate:\n"
+            f"{geometry_contract}\n"
+            "The output MUST match every point above exactly. "
+            "If any tower count, height ratio, silhouette feature, crown shape, or podium form "
+            "differs from the contract above, the output is WRONG.\n"
+        )
+
+    base_instruction = (
         "You are an expert architectural visualization artist. "
-        "Image 1 is a new architectural mass/volume model — the EXACT geometric blueprint for a new building. "
-        "Image 2 is an existing photorealistic render of a site whose building will be replaced.\n\n"
-        "CRITICAL — TASK: Replace the building in Image 2 with the new building defined by Image 1. "
-        "The result must look like the new building was ALWAYS PART OF THE SCENE in Image 2.\n\n"
+        "Image 1 is a new architectural mass/volume model — the EXACT geometric blueprint for the new building. "
+        "Image 2 is an existing photorealistic render of the site. The building in Image 2 must be replaced.\n\n"
+        "⚠ TASK: Replace the existing building in Image 2 with the new building defined by Image 1. "
+        "The new building occupies EXACTLY the same position and footprint in the scene.\n\n"
         "GEOMETRY RULES (from Image 1, absolutely non-negotiable):\n"
-        "- SILHOUETTE: Reproduce the EXACT outer silhouette of Image 1 — do not alter height, width, or outline.\n"
-        "- HEIGHT: Tower height is a fixed constraint. Do NOT compress, elongate, or rescale vertically.\n"
-        "- PROPORTIONS: Width-to-height ratio must match Image 1 exactly.\n"
+        "- Reproduce the EXACT outer silhouette of Image 1 — do not alter height, width, or outline.\n"
+        "- Tower height is a fixed constraint. Do NOT compress, elongate, or rescale vertically.\n"
+        "- Width-to-height ratio must match Image 1 exactly.\n"
         "- Preserve every feature: crown shape, podium, setbacks, connecting elements, lattice structures.\n"
-        "- Do NOT simplify, redesign, or 'improve' any aspect of the geometry from Image 1.\n\n"
+        "- Do NOT simplify, normalize, redesign, or 'improve' any aspect of the geometry from Image 1.\n\n"
         "SCENE INTEGRATION (from Image 2):\n"
         "- Match the camera angle, perspective, and focal length of Image 2 EXACTLY.\n"
         "- Preserve ALL surrounding elements unchanged: sky, roads, vegetation, other buildings, infrastructure.\n"
@@ -298,9 +418,11 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
         "- The new building must cast shadows consistent with Image 2's sun angle and atmosphere.\n"
         "- Adapt facade materials to look photorealistic within Image 2's environmental context.\n"
         "Output only the rendered image, no text."
-    ))
+    )
+    instruction = _load_prompt("update_render_direct_instruction", base_instruction)
+    instruction += geometry_section
     if prompt.strip():
-        instruction += f" Additional direction: {prompt.strip()}"
+        instruction += f"\nAdditional direction: {prompt.strip()}"
 
     payload = {
         "contents": [{"parts": [
