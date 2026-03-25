@@ -802,7 +802,7 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
         inline = part.get("inlineData") or part.get("inline_data")
         if inline:
             img_bytes = base64.b64decode(inline["data"])
-            placed_path = UPLOADS_DIR / f"placed_{uuid.uuid4().hex}.png"
+            placed_path = OUTPUTS_DIR / f"placed_{uuid.uuid4().hex}.png"
             placed_path.write_bytes(img_bytes)
             return placed_path, geometry_contract
 
