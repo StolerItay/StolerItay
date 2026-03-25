@@ -354,9 +354,12 @@ def main() -> None:
 
         # Skip Stage 2 if Stage 1 geometry is too poor — bad placement = useless materialization
         s1_scores = avg_scores(s1_entries, list(STAGE1_DIMENSION_TO_KEYS.keys()))
-        if s1_scores.get("geometry_accuracy", 0) < args.score_threshold:
+        s1_geom = s1_scores.get("geometry_accuracy", 0.0)
+        print(f"\n  [skip check] geometry_accuracy={s1_geom:.1f}  threshold={args.score_threshold}"
+              f"  → {'SKIP Stage 2' if s1_geom < args.score_threshold else 'proceed to Stage 2'}")
+        if s1_geom < args.score_threshold:
             print(
-                f"\n  [skip] Stage 1 geometry_accuracy={s1_scores['geometry_accuracy']:.1f} "
+                f"\n  [skip] Stage 1 geometry_accuracy={s1_geom:.1f} "
                 f"< {args.score_threshold} — skipping Stage 2 this cycle, fixing Stage 1 first."
             )
             history.append({"cycle": cycle, "s1_scores": s1_scores, "s2_scores": {}})

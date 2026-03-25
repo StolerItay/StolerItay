@@ -239,7 +239,8 @@ def _download_outputs(
         full_url = f"{server}{url}" if url.startswith("/") else url
         model_short = model_short_map.get(entry["model"], entry["model"])
         tab_part = entry.get("tab", entry.get("stage", "render"))
-        img_name = f"{entry['pair']}_{tab_part}_{model_short}.png"
+        run_idx = entry.get("run", 1)
+        img_name = f"{entry['pair']}_{tab_part}_{model_short}_r{run_idx}.png"
         img_path = out_dir / img_name
         try:
             r = client.get(full_url, timeout=30)
