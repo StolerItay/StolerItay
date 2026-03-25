@@ -401,7 +401,183 @@ async def gemini_25_render(mass_path: Path, reference_path: Path, prompt: str = 
     return await gemini_generate_render(mass_path, reference_path, rich_prompt)
 
 
-def _erase_building_from_render(mass_path: Path, render_path: Path) -> bytes:
+async def _analyze_for_materialization(
+    placed_mass_path: Path,
+    style_ref_path: Path,
+    geometry_contract: str,
+    prompt: str,
+    analyzer_model: str,
+    key: str,
+) -> str:
+    """Stage-2 analyzer: given a placed white-mass scene + style reference,
+    produce a detailed materialization prompt that instructs the image-gen model
+    to paint materials/lighting onto the white volume — without touching geometry
+    or background.
+    """
+    placed_b64, placed_mime = _b64_for_gemini(placed_mass_path, is_render=True)
+    style_b64,  style_mime  = _b64_for_gemini(style_ref_path,   is_render=True)
+
+    geometry_block = ""
+    if geometry_contract:
+        geometry_block = (
+            "\n\nGEOMETRY CONTRACT (already correctly placed in Image 1 — "
+            "must be reproduced exactly):\n"
+            f"{geometry_contract}\n"
+        )
+
+    instruction = (
+        "You are a senior architectural visualization director.\n"
+        "Image 1: a composite scene showing a new building's MASS MODEL — a clean white/grey "
+        "volume — already placed at the correct position, scale, and perspective in an urban scene. "
+        "The surrounding context (sky, roads, trees, neighboring buildings) is real and must remain untouched.\n"
+        "Image 2: a photorealistic reference render that defines the target STYLE — materials, "
+        "facade texture, glass type, lighting, time of day, atmosphere.\n"
+        + geometry_block +
+        "\nTASK: Write a detailed image generation prompt (250-400 words) that instructs an AI "
+        "image model to MATERIALIZE the white/grey mass in Image 1 by applying photorealistic "
+        "style from Image 2. The prompt MUST enforce these rules:\n\n"
+        "1. GEOMETRY IS LOCKED — the white mass in Image 1 shows the EXACT final silhouette, "
+        "proportions, and position. Do NOT alter height, width, footprint, or any architectural feature.\n"
+        "2. BACKGROUND IS LOCKED — every pixel outside the white mass (sky, roads, trees, "
+        "surrounding buildings, ground) must remain IDENTICAL to Image 1.\n"
+        "3. CAMERA ANGLE IS LOCKED — reproduce the exact viewpoint from Image 1.\n"
+        "4. STYLE TRANSFER ONLY — apply to the mass: facade materials, glass, cladding, "
+        "structural details, windows, lighting and shadows — all matching Image 2's aesthetic.\n"
+        "5. No new elements, no repositioning, no background changes.\n\n"
+        "Cover in the prompt:\n"
+        "- Exact facade materials, textures, colors, glass type from Image 2\n"
+        "- Window pattern, mullion grid, cladding panels\n"
+        "- Lighting: time of day, shadow direction, reflections\n"
+        "- Atmospheric conditions (sky, haze, ambient light)\n"
+        "- How the building base meets the ground plane visible in Image 1\n\n"
+        "Output only the prompt text, no preamble."
+    )
+    if prompt.strip():
+        instruction += f"\n\nAdditional user direction: {prompt.strip()}"
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": instruction},
+            {"inline_data": {"mime_type": placed_mime, "data": placed_b64}},
+            {"inline_data": {"mime_type": style_mime,  "data": style_b64}},
+        ]}],
+    }
+    _url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{analyzer_model}:generateContent?key={key}"
+    )
+    async with httpx.AsyncClient(timeout=180) as http:
+        r = await http.post(_url, json=payload)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def gemini_materialize_placed_mass(
+    placed_mass_path: Path,
+    style_ref_path: Path,
+    geometry_contract: str = "",
+    prompt: str = "",
+    analyzer_model: str = "gemini-2.5-pro",
+) -> Path:
+    """Stage 2 of the staged pipeline — materialization only.
+
+    The placed_mass_path (stage-1 output) already shows the white/grey mass
+    correctly seated in the scene at the right scale, angle, and position.
+    This function applies photorealistic materials and lighting to ONLY the
+    white volume, keeping the background and proportions pixel-perfect.
+
+    Pipeline:
+      analyzer  → detailed materialization prompt (geometry + bg locked)
+      image-gen → paint style onto white mass
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    rich_prompt = await _analyze_for_materialization(
+        placed_mass_path, style_ref_path, geometry_contract, prompt, analyzer_model, key
+    )
+    print(f"[staged s2] materialization prompt ({len(rich_prompt)} chars)", flush=True)
+
+    placed_b64, placed_mime = _b64_for_gemini(placed_mass_path, is_render=True)
+    style_b64,  style_mime  = _b64_for_gemini(style_ref_path,   is_render=True)
+
+    geometry_section = ""
+    if geometry_contract:
+        geometry_section = (
+            "\n\nGEOMETRY CONTRACT — the white mass in Image 1 already matches these specs exactly. "
+            "Reproduce them faithfully:\n"
+            f"{geometry_contract}\n"
+        )
+
+    base_instruction = (
+        "You are an expert architectural visualization artist specializing in "
+        "photorealistic rendering and material application.\n\n"
+        "Image 1: a composite scene — the new building exists as a clean WHITE/GREY MASS MODEL "
+        "already placed at the correct position, scale, and camera angle in the urban scene. "
+        "The surrounding environment (sky, roads, trees, neighboring buildings, ground) is real.\n"
+        "Image 2: a photorealistic architectural reference that defines the target style: "
+        "facade materials, glass, cladding, window patterns, lighting, time of day, atmosphere.\n"
+        + geometry_section +
+        "\n⚠ CRITICAL TASK: Apply the style from Image 2 ONTO the white/grey mass in Image 1.\n\n"
+        "ABSOLUTE RULES:\n"
+        "1. The white/grey mass in Image 1 defines the EXACT silhouette and proportions — "
+        "do NOT change height, width, footprint, crown shape, or any architectural feature.\n"
+        "2. EVERY pixel outside the white mass area (background, sky, roads, trees, "
+        "neighboring buildings) must remain EXACTLY as in Image 1 — pixel-perfect.\n"
+        "3. The camera angle, perspective, and framing must be IDENTICAL to Image 1.\n"
+        "4. Apply to the mass: photorealistic facade materials, glass, cladding, "
+        "window grids, structural details, lighting and shadows from Image 2's style.\n"
+        "5. The building must look like it physically belongs in the scene from Image 1 "
+        "with matching lighting direction and atmospheric conditions.\n\n"
+        "Do NOT recompose, do NOT move the building, do NOT change the background.\n\n"
+        f"Detailed materialization guide:\n{rich_prompt}"
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": base_instruction},
+            {"inline_data": {"mime_type": placed_mime, "data": placed_b64}},
+            {"inline_data": {"mime_type": style_mime,  "data": style_b64}},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.0-flash-exp",
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{_mid}:generateContent?key={key}"
+        )
+        async with httpx.AsyncClient(timeout=180) as http:
+            r = await http.post(_url, json=payload)
+        print(f"[staged s2 materialize] {_mid} → {r.status_code}: {r.text[:200]}", flush=True)
+        if r.status_code in (404, 400, 403):
+            _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+            continue
+        if r.status_code != 200:
+            _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+            continue
+        data = r.json()
+        break
+
+    if data:
+        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            if "inlineData" in part:
+                img_bytes = base64.b64decode(part["inlineData"]["data"])
+                out_path = OUTPUTS_DIR / f"{uuid.uuid4()}.png"
+                out_path.write_bytes(img_bytes)
+                return out_path
+
+    raise ValueError(f"Stage-2 materialization: Gemini returned no image. Errors: {_errors}")
+
+
     """Erase the existing building from the render using the mass model silhouette as a mask.
 
     Replaces the building region with a blurred fill so Gemini cannot copy the old building's
@@ -532,16 +708,14 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
-async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path:
+async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tuple[Path, str]:
     """Stage 1 of the staged pipeline.
 
-    Ask Gemini's image-gen model to take the mass/wireframe model and place it
-    cleanly into the background scene at the correct position, scale, and
-    perspective — outputting a clean massing diagram in the scene rather than
-    a fully rendered image.
+    Places the mass/wireframe model cleanly into the background scene at the
+    correct position, scale, and perspective — outputting a clean white/grey
+    massing diagram in the scene rather than a fully rendered image.
 
-    The output is used as a better "mass" input for Stage 2, because the
-    geometry is already seated in the correct spatial context.
+    Returns (placed_path, geometry_contract) so Stage 2 can lock the proportions.
     """
     key = get_gemini_key()
     if not key:
@@ -625,7 +799,7 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path
             img_bytes = base64.b64decode(inline["data"])
             placed_path = UPLOADS_DIR / f"placed_{uuid.uuid4().hex}.png"
             placed_path.write_bytes(img_bytes)
-            return placed_path
+            return placed_path, geometry_contract
 
     raise ValueError(f"Stage-1 placement: Gemini returned no image. Response: {data}")
 
@@ -642,25 +816,24 @@ async def gemini_staged_update_render(
         Positions the mass model cleanly in the scene at the correct perspective
         and scale. Background is untouched; building is a clean volume diagram.
 
-    Stage 2 — Render: gemini_25_render (analyzer → image-gen)
-        Takes the placed mass as its geometry input and the original render
-        (with old building erased) as the style/scene reference. Because the
-        mass is already correctly seated in the scene, the generator only needs
-        to apply materials and lighting — not solve placement simultaneously.
+    Stage 2 — Materialize: gemini_materialize_placed_mass
+        The placed mass already has correct position/scale/angle in the scene.
+        Stage 2 only paints photorealistic materials and lighting onto the white
+        volume — geometry, proportions, background, and camera angle are all locked.
+        Style reference is the original render (not erased) so Gemini can match
+        materials/lighting directly from the real scene photograph.
     """
     print("[staged] Stage 1: placing mass in scene…", flush=True)
-    placed_mass_path = await gemini_place_mass_in_scene(mass_path, render_path)
+    placed_mass_path, geometry_contract = await gemini_place_mass_in_scene(mass_path, render_path)
     try:
-        # Erase old building from render so stage-2 uses only scene context
-        clean_render_path = UPLOADS_DIR / f"clean_{uuid.uuid4().hex}.png"
-        clean_render_path.write_bytes(_erase_building_from_render(mass_path, render_path))
-        print("[staged] Stage 2: rendering placed mass…", flush=True)
-        try:
-            out_path = await gemini_25_render(
-                placed_mass_path, clean_render_path, prompt, analyzer_model=analyzer_model
-            )
-        finally:
-            clean_render_path.unlink(missing_ok=True)
+        print("[staged] Stage 2: materializing placed mass…", flush=True)
+        out_path = await gemini_materialize_placed_mass(
+            placed_mass_path,
+            render_path,          # original render — best style reference
+            geometry_contract,
+            prompt,
+            analyzer_model,
+        )
         return out_path
     finally:
         placed_mass_path.unlink(missing_ok=True)
