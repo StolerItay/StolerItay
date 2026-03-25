@@ -425,14 +425,13 @@ async def _analyze_for_materialization(
             f"{geometry_contract}\n"
         )
 
-    instruction = (
+    _s2a_base = (
         "You are a senior architectural visualization director.\n"
         "Image 1: a composite scene showing a new building's MASS MODEL — a clean white/grey "
         "volume — already placed at the correct position, scale, and perspective in an urban scene. "
         "The surrounding context (sky, roads, trees, neighboring buildings) is real and must remain untouched.\n"
         "Image 2: a photorealistic reference render that defines the target STYLE — materials, "
         "facade texture, glass type, lighting, time of day, atmosphere.\n"
-        + geometry_block +
         "\nTASK: Write a detailed image generation prompt (250-400 words) that instructs an AI "
         "image model to MATERIALIZE the white/grey mass in Image 1 by applying photorealistic "
         "style from Image 2. The prompt MUST enforce these rules:\n\n"
@@ -452,6 +451,7 @@ async def _analyze_for_materialization(
         "- How the building base meets the ground plane visible in Image 1\n\n"
         "Output only the prompt text, no preamble."
     )
+    instruction = _load_prompt("stage2_analyzer_instruction", _s2a_base) + geometry_block
     if prompt.strip():
         instruction += f"\n\nAdditional user direction: {prompt.strip()}"
 
@@ -510,7 +510,7 @@ async def gemini_materialize_placed_mass(
             f"{geometry_contract}\n"
         )
 
-    base_instruction = (
+    _s2m_base = (
         "You are an expert architectural visualization artist specializing in "
         "photorealistic rendering and material application.\n\n"
         "Image 1: a composite scene — the new building exists as a clean WHITE/GREY MASS MODEL "
@@ -518,7 +518,6 @@ async def gemini_materialize_placed_mass(
         "The surrounding environment (sky, roads, trees, neighboring buildings, ground) is real.\n"
         "Image 2: a photorealistic architectural reference that defines the target style: "
         "facade materials, glass, cladding, window patterns, lighting, time of day, atmosphere.\n"
-        + geometry_section +
         "\n⚠ CRITICAL TASK: Apply the style from Image 2 ONTO the white/grey mass in Image 1.\n\n"
         "ABSOLUTE RULES:\n"
         "1. The white/grey mass in Image 1 defines the EXACT silhouette and proportions — "
@@ -530,8 +529,12 @@ async def gemini_materialize_placed_mass(
         "window grids, structural details, lighting and shadows from Image 2's style.\n"
         "5. The building must look like it physically belongs in the scene from Image 1 "
         "with matching lighting direction and atmospheric conditions.\n\n"
-        "Do NOT recompose, do NOT move the building, do NOT change the background.\n\n"
-        f"Detailed materialization guide:\n{rich_prompt}"
+        "Do NOT recompose, do NOT move the building, do NOT change the background."
+    )
+    base_instruction = (
+        _load_prompt("stage2_materialize_instruction", _s2m_base)
+        + geometry_section
+        + f"\n\nDetailed materialization guide:\n{rich_prompt}"
     )
 
     payload = {
@@ -736,7 +739,7 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
             "MUST appear correctly in your output. Do NOT rescale, simplify, or omit any element.\n"
         )
 
-    instruction = (
+    _s1_base = (
         "You are an architectural visualization assistant. "
         "Image 1 is a new building massing model — a wireframe/volume diagram that defines the EXACT geometry "
         "(tower count, heights, silhouette, crown shapes, podium) of a new building. "
@@ -757,7 +760,8 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
         "5. Do NOT apply photorealistic materials, textures, windows, or facade details — "
         "output a clean massing/volume diagram: flat white or light grey solid forms.\n"
         "6. Do NOT add shadows or atmospheric effects to the mass — keep it as a neutral clean volume.\n"
-        + geometry_section +
+    )
+    instruction = _load_prompt("stage1_placement_instruction", _s1_base) + geometry_section + (
         "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
         "No text, no annotations."
     )

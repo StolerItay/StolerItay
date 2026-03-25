@@ -10,3 +10,8 @@ backend/uploads/
 backend/outputs/
 *.egg-info/
 .DS_Store
+# Local prompt overrides — optimized per-machine, not tracked in git
+backend/prompt_config.json
+# Local test runs and optimizer history
+backend/opt_runs/
+backend/optimizer_history/
