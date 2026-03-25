@@ -785,8 +785,24 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
         "clip, or cut off any part of the mass model. If a tower is tall, make the output show it "
         "from ground to crown. The mass may extend above the original building height — that is correct.\n"
     )
-    instruction = _load_prompt("stage1_placement_instruction", _s1_base) + geometry_section + (
-        "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
+    # Hard rules always appended after the config prompt — cannot be overridden by prompt_config.json
+    _s1_hard_rules = (
+        "\n\nHARD RULES (always apply, cannot be overridden):\n"
+        "RULE A — COMPLETE REPLACEMENT: Image 1 may show multiple towers, a podium, connectors, "
+        "and satellite buildings. ALL of them form ONE complex. You MUST erase and replace EVERY "
+        "sub-building on the site — towers, podium, base, bridges, annexes — leaving NONE of the "
+        "original Image 2 buildings inside the new complex's footprint. Do NOT keep any "
+        "photorealistic building from Image 2 within the footprint of the mass.\n"
+        "RULE B — FULL MASS VISIBLE: The ENTIRE mass from Image 1 must appear completely — "
+        "crown at the very top, base/podium at ground level, every tower, every connector. "
+        "Do NOT crop, clip, or cut off any part. If a tower is taller than the original building, "
+        "show it fully — the mass may extend above the original building height.\n"
+    )
+    instruction = (
+        _load_prompt("stage1_placement_instruction", _s1_base)
+        + _s1_hard_rules
+        + geometry_section
+        + "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
         "No text, no annotations."
     )
 
