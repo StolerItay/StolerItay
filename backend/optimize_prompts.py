@@ -216,19 +216,13 @@ def main() -> None:
     parser.add_argument("--models", default="gemini-staged-pro")
     parser.add_argument("--score-threshold", type=float, default=SCORE_THRESHOLD,
                         help=f"Rewrite prompts scoring below this value (default {SCORE_THRESHOLD})")
-    parser.add_argument("--stage2-only", action="store_true",
-                        help="Skip Stage 1 in every cycle — reuse --stage1-summary")
     parser.add_argument("--stage1-summary", type=Path, default=None,
-                        help="Required with --stage2-only")
+                        help="Path to existing stage1_summary JSON (skips Stage 1 on first cycle)")
     args = parser.parse_args()
 
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_key:
         print("ERROR: GEMINI_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
-
-    if args.stage2_only and not args.stage1_summary:
-        print("ERROR: --stage2-only requires --stage1-summary", file=sys.stderr)
         sys.exit(1)
 
     HISTORY_DIR.mkdir(exist_ok=True)
@@ -248,7 +242,7 @@ def main() -> None:
         backup_config(cycle)
 
         # ── Stage 1 ───────────────────────────────────────────────────────────
-        if not args.stage2_only or stage1_summary_path is None:
+        if stage1_summary_path is None:
             print(f"\n[Cycle {cycle}] Stage 1 — placing mass in scene…")
             run_test_script([
                 "--folder", str(args.folder),
