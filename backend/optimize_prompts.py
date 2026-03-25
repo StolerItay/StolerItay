@@ -352,6 +352,16 @@ def main() -> None:
             stage_label="Stage 1",
         )
 
+        # Skip Stage 2 if Stage 1 geometry is too poor — bad placement = useless materialization
+        s1_scores = avg_scores(s1_entries, list(STAGE1_DIMENSION_TO_KEYS.keys()))
+        if s1_scores.get("geometry_accuracy", 0) < args.score_threshold:
+            print(
+                f"\n  [skip] Stage 1 geometry_accuracy={s1_scores['geometry_accuracy']:.1f} "
+                f"< {args.score_threshold} — skipping Stage 2 this cycle, fixing Stage 1 first."
+            )
+            history.append({"cycle": cycle, "s1_scores": s1_scores, "s2_scores": {}})
+            continue
+
         # ── Stage 2: run + judge ───────────────────────────────────────────────
         print(f"\n[Cycle {cycle}] Stage 2 — materializing + judging…")
         run_test_script([
