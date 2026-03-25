@@ -581,6 +581,7 @@ async def gemini_materialize_placed_mass(
     raise ValueError(f"Stage-2 materialization: Gemini returned no image. Errors: {_errors}")
 
 
+def _erase_building_from_render(mass_path: Path, render_path: Path) -> bytes:
     """Erase the existing building from the render using the mass model silhouette as a mask.
 
     Replaces the building region with a blurred fill so Gemini cannot copy the old building's

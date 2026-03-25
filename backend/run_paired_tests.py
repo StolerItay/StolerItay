@@ -110,6 +110,10 @@ def submit_job(server: str, tab: str, model: str, pair: dict, client: httpx.Clie
     return r.json()["jobId"]
 
 
+def _mime(p: Path) -> str:
+    return "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+
+
 def submit_stage1_job(server: str, pair: dict, client: httpx.Client) -> str:
     """Submit a Stage-1 place-mass job; returns job_id."""
     mass_path: Path = pair["mass"]
@@ -118,8 +122,8 @@ def submit_stage1_job(server: str, pair: dict, client: httpx.Client) -> str:
         r = client.post(
             f"{server}/api/place-mass",
             files={
-                "mass":   (mass_path.name, mf, "image/png"),
-                "render": (render_path.name, rf, "image/jpeg"),
+                "mass":   (mass_path.name, mf, _mime(mass_path)),
+                "render": (render_path.name, rf, _mime(render_path)),
             },
             timeout=60,
         )
@@ -128,7 +132,9 @@ def submit_stage1_job(server: str, pair: dict, client: httpx.Client) -> str:
 
 
 def submit_stage2_job(server: str, entry: dict, client: httpx.Client) -> str:
-    """Submit a Stage-2 materialize job using the placed_mass saved from Stage 1."""
+    """Submit a Stage-2 materialize job.
+    Uses placed_mass (Stage-1 output) + original render (style reference).
+    """
     placed_path: Path = entry["_placed_path"]
     render_path: Path = entry["_render_path"]
     geometry_contract: str = entry.get("geometry_contract") or ""
@@ -137,8 +143,8 @@ def submit_stage2_job(server: str, entry: dict, client: httpx.Client) -> str:
         r = client.post(
             f"{server}/api/materialize-mass",
             files={
-                "placed_mass": (placed_path.name, pf, "image/png"),
-                "render":      (render_path.name, rf, "image/jpeg"),
+                "placed_mass": (placed_path.name, pf, _mime(placed_path)),
+                "render":      (render_path.name, rf, _mime(render_path)),
             },
             data={"model": model, "geometry_contract": geometry_contract, "prompt": ""},
             timeout=60,
@@ -232,7 +238,8 @@ def _download_outputs(
         url = entry["output_url"]
         full_url = f"{server}{url}" if url.startswith("/") else url
         model_short = model_short_map.get(entry["model"], entry["model"])
-        img_name = f"{entry['pair']}_{entry['tab']}_{model_short}.png"
+        tab_part = entry.get("tab", entry.get("stage", "render"))
+        img_name = f"{entry['pair']}_{tab_part}_{model_short}.png"
         img_path = out_dir / img_name
         try:
             r = client.get(full_url, timeout=30)
@@ -245,19 +252,29 @@ def _download_outputs(
 
 
 def judge_entry(server: str, entry: dict, client: "httpx.Client") -> dict | None:
-    """Call /api/judge for a completed entry. Returns scores dict or None on failure."""
+    """Call /api/judge for a completed entry. Returns scores dict or None on failure.
+
+    For full-pipeline and stage1 entries, uses _mass_path (original mass) as geometry ref.
+    For stage2-only entries, uses _placed_path (placed white mass) as geometry ref since
+    the original mass is not available — the placed mass still carries the geometry.
+    The style reference is always _render_path (original render).
+    """
     if entry["status"] != "done" or not entry.get("output_url"):
         return None
-    mass_path: Path = entry["_mass_path"]
+    # Geometry reference: prefer original mass; fall back to placed mass for stage2 entries
+    mass_path: Path = entry.get("_mass_path") or entry.get("_placed_path")
     render_path: Path = entry["_render_path"]
+    if not mass_path:
+        print(f"  [judge warn] {entry['pair']}: no mass or placed path — skipping")
+        return None
     output_url: str = entry["output_url"]
     try:
         with mass_path.open("rb") as mf, render_path.open("rb") as rf:
             r = client.post(
                 f"{server}/api/judge",
                 files={
-                    "mass":   (mass_path.name, mf, "image/png"),
-                    "render": (render_path.name, rf, "image/jpeg"),
+                    "mass":   (mass_path.name, mf, _mime(mass_path)),
+                    "render": (render_path.name, rf, _mime(render_path)),
                 },
                 data={"output_url": output_url},
                 timeout=90,
@@ -314,7 +331,7 @@ def _run_stage1(args: "argparse.Namespace", server: str, client: "httpx.Client",
         print(f"ERROR: No valid pairs found in {args.folder}", file=sys.stderr)
         sys.exit(1)
 
-    models = [m.strip() for m in args.models.split(",") if m.strip()
+    models = [m.strip() for m in args.models.split(",")
               if m.strip() in ("gemini-staged-pro", "gemini-staged-flash")]
     if not models:
         models = ["gemini-staged-pro"]
@@ -380,7 +397,7 @@ def _run_stage2(args: "argparse.Namespace", server: str, client: "httpx.Client",
         sys.exit(1)
 
     s1_dir = stage1_path.parent
-    models = [m.strip() for m in args.models.split(",") if m.strip()
+    models = [m.strip() for m in args.models.split(",")
               if m.strip() in ("gemini-staged-pro", "gemini-staged-flash")]
     if not models:
         models = ["gemini-staged-pro"]
@@ -388,15 +405,19 @@ def _run_stage2(args: "argparse.Namespace", server: str, client: "httpx.Client",
     repeat = max(1, args.repeat)
     print(f"\nStage 2 — materializing {len(done_s1)} placed-mass image(s) × {len(models)} model(s) × {repeat} repeat(s)")
 
-    # Rebuild render-path lookup from original folder
+    # Rebuild render + mass path lookups from the original test folder
     render_lookup: dict[str, Path] = {}
+    mass_lookup: dict[str, Path] = {}
     for pair_dir in sorted(args.folder.iterdir()):
         if not pair_dir.is_dir():
             continue
         imgs = [p for p in pair_dir.iterdir() if p.suffix.lower() in ALLOWED_SUFFIXES]
         render = next((p for p in imgs if "--render" in p.stem.lower()), None)
+        mass   = next((p for p in imgs if "--mass"   in p.stem.lower()), None)
         if render:
             render_lookup[pair_dir.name] = render
+        if mass:
+            mass_lookup[pair_dir.name] = mass
 
     job_entries: list[dict] = []
     for s1 in done_s1:
@@ -409,6 +430,7 @@ def _run_stage2(args: "argparse.Namespace", server: str, client: "httpx.Client",
         if not render_path:
             print(f"  [warn] No render found for pair {pair_name}, skipping")
             continue
+        mass_path  = mass_lookup.get(pair_name)   # original mass — for judge geometry ref
         geometry_contract = s1.get("geometry_contract") or ""
 
         for model in models:
@@ -416,7 +438,11 @@ def _run_stage2(args: "argparse.Namespace", server: str, client: "httpx.Client",
                 entry: dict = {
                     "job_id": None, "pair": pair_name, "model": model, "run": run_idx,
                     "placed_file": s1["local_file"], "render": render_path.name,
-                    "_placed_path": placed_local, "_render_path": render_path,
+                    "mass": mass_path.name if mass_path else "",
+                    "_placed_path": placed_local,
+                    "_render_path": render_path,
+                    # Judge uses original mass for geometry accuracy; placed mass as fallback
+                    "_mass_path": mass_path or placed_local,
                     "geometry_contract": geometry_contract,
                     "status": "error", "output_url": None,
                     "error_msg": None, "submit_error": None,
