@@ -212,7 +212,7 @@ def print_summary(job_entries: list[dict], server: str) -> None:
         for e in done:
             out = e.get("output_url", "")
             full_url = f"{server}{out}" if out and out.startswith("/") else out
-            print(f"  [{e['pair']:6s}] [{e['tab']:16s}] [{e['model']:16s}]")
+            print(f"  [{e['pair']:6s}] [{e.get('tab', e.get('stage', 'staged')):16s}] [{e['model']:16s}]")
             print(f"     mass  : {e['mass']}")
             print(f"     render: {e['render']}")
             print(f"     output: {full_url}")
@@ -221,7 +221,7 @@ def print_summary(job_entries: list[dict], server: str) -> None:
         print("\nFailed jobs:")
         for e in errors:
             msg = e.get("error_msg") or e.get("submit_error") or "?"
-            print(f"  [{e['pair']:6s}] [{e['tab']:16s}] [{e['model']:16s}]  {msg}")
+            print(f"  [{e['pair']:6s}] [{e.get('tab', e.get('stage', 'staged')):16s}] [{e['model']:16s}]  {msg}")
 
 
 def _download_outputs(
