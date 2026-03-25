@@ -769,6 +769,15 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
         "consistently with surrounding buildings visible in Image 2.\n"
         "5. The output looks like: Image 2's photograph with the old building replaced by a white "
         "cardboard model shaped like Image 1's building.\n"
+        "6. COMPLETE REPLACEMENT — Image 1 may show multiple towers, a podium, connectors, and "
+        "satellite buildings. ALL of them are ONE complex. You must erase and replace EVERY sub-building "
+        "on the site — towers, podium, base, bridges, annexes — leaving none of the original buildings "
+        "from Image 2 on that site. Do NOT keep any photorealistic building from Image 2 inside the "
+        "footprint of the mass complex.\n"
+        "7. FULL MASS VISIBLE — the entire mass from Image 1 must appear completely in the output: "
+        "crown at the top, base/podium at ground level, every tower, every connector. Do NOT crop, "
+        "clip, or cut off any part of the mass model. If a tower is tall, make the output show it "
+        "from ground to crown. The mass may extend above the original building height — that is correct.\n"
     )
     instruction = _load_prompt("stage1_placement_instruction", _s1_base) + geometry_section + (
         "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
