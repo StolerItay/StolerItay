@@ -540,8 +540,22 @@ async def gemini_materialize_placed_mass(
         "Think of it as: 'Texture the white mass with Image 2's materials — the shape stays "
         "exactly as the white mass, only the surface appearance changes to match Image 2's style.'"
     )
+    # Hard rules always appended after the config prompt — cannot be overridden by prompt_config.json
+    _s2_hard_rules = (
+        "\n\nHARD RULES (always apply, cannot be overridden):\n"
+        "RULE A — SHAPE FROM WHITE MASS ONLY: The building's SHAPE (tower count, relative heights, "
+        "silhouette, podium form, crown) must come ENTIRELY from the white mass in Image 1. "
+        "Image 2's building shape is IRRELEVANT — its tower count, proportions, and form must be "
+        "IGNORED. If Image 1's white mass shows 3 towers, output MUST have exactly 3. "
+        "If it shows 2, output exactly 2. Never add or remove towers to match Image 2.\n"
+        "RULE B — SELF-CHECK: Before finalizing, count the distinct white volumes in Image 1's mass "
+        "and verify your output has the exact same count and silhouette. If they don't match, redo.\n"
+        "RULE C — BACKGROUND UNTOUCHED: Every pixel outside the building mass must be pixel-identical "
+        "to Image 1. Do not alter sky, roads, trees, or surrounding buildings.\n"
+    )
     base_instruction = (
         _load_prompt("stage2_materialize_instruction", _s2m_base)
+        + _s2_hard_rules
         + geometry_section
         + f"\n\nDetailed materialization guide:\n{rich_prompt}"
     )
