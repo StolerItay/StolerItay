@@ -3,24 +3,20 @@
 optimize_prompts.py — Automated Prompt Optimization Loop
 =========================================================
 
-Runs the staged pipeline (Stage 1 + Stage 2), judges outputs with Gemini,
-identifies the weakest prompt, rewrites it with Gemini 2.5-pro, saves it to
-prompt_config.json, and repeats for N cycles.
+Every cycle:
+  1. Run Stage 1 (place mass) with --judge → score geometry_accuracy + background_preservation
+     → rewrite stage1_placement_instruction if weak
+  2. Run Stage 2 × repeat (materialize) with --judge → score style_match + overall
+     → rewrite stage2_analyzer_instruction / stage2_materialize_instruction if weak
+  3. Save improved prompts to prompt_config.json (server hot-reloads, no restart needed)
 
 Because _load_prompt() re-reads prompt_config.json on every API call, the
 running server picks up prompt changes automatically — no restart needed.
 
-Scores tracked per cycle:
-  geometry_accuracy       → drives: stage1_placement_instruction
-  background_preservation → drives: stage1_placement_instruction
-  style_match             → drives: stage2_analyzer_instruction
-  overall                 → drives: stage2_materialize_instruction
-
 Usage
 -----
   python optimize_prompts.py --folder "Tests\\replace in a render" --cycles 5
-  python optimize_prompts.py --folder "Tests\\replace in a render" --cycles 3 \\
-      --stage2-only --stage1-summary "opt_runs/.../stage1_summary_xxx.json"
+  python optimize_prompts.py --folder "Tests\\replace in a render" --cycles 3 --repeat 4
 """
 
 import argparse
@@ -30,7 +26,6 @@ import os
 import shutil
 import subprocess
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -48,18 +43,24 @@ OPTIMIZER_MODEL = "gemini-2.5-pro"
 SCORE_THRESHOLD = 7.5
 MAX_IMAGES_FOR_CONTEXT = 2
 
-DIMENSION_TO_KEYS = {
-    "geometry_accuracy":        ["stage1_placement_instruction"],
-    "background_preservation":  ["stage1_placement_instruction"],
-    "style_match":              ["stage2_analyzer_instruction", "stage2_materialize_instruction"],
-    "overall":                  ["stage2_materialize_instruction"],
+# Stage 1: judge scores → which prompts to rewrite
+STAGE1_DIMENSION_TO_KEYS = {
+    "geometry_accuracy":       ["stage1_placement_instruction"],
+    "background_preservation": ["stage1_placement_instruction"],
+}
+
+# Stage 2: judge scores → which prompts to rewrite
+STAGE2_DIMENSION_TO_KEYS = {
+    "style_match": ["stage2_analyzer_instruction", "stage2_materialize_instruction"],
+    "overall":     ["stage2_materialize_instruction"],
 }
 
 KEY_DESCRIPTIONS = {
     "stage1_placement_instruction": (
         "Stage 1 system prompt. Controls how Gemini places the white/grey mass model "
         "into the real scene. Affects: correct position, scale, perspective, "
-        "geometry accuracy, and background preservation."
+        "geometry accuracy (exact silhouette / proportions), and background preservation "
+        "(all surroundings unchanged)."
     ),
     "stage2_analyzer_instruction": (
         "Stage 2 analyzer prompt. Instructs the text model to write a detailed "
@@ -100,8 +101,7 @@ def run_test_script(extra_args: list[str]) -> int:
     return subprocess.call(cmd)
 
 
-def avg_scores(entries: list[dict]) -> dict[str, float]:
-    keys = ["geometry_accuracy", "style_match", "background_preservation", "overall"]
+def avg_scores(entries: list[dict], keys: list[str]) -> dict[str, float]:
     totals: dict[str, list[float]] = {k: [] for k in keys}
     for e in entries:
         j = e.get("judge")
@@ -132,7 +132,7 @@ def rewrite_prompt(
     weak_dimension: str,
     avg_score: float,
     worst: list[dict],
-    stage2_dir: Path | None,
+    output_dir: Path | None,
     gemini_key: str,
 ) -> str | None:
     """Ask Gemini 2.5-pro to rewrite the prompt based on judge feedback."""
@@ -168,7 +168,7 @@ def rewrite_prompt(
     parts: list[dict] = [{"text": rewriter_prompt}]
 
     # Add worst output images as visual context for the rewriter
-    if stage2_dir and stage2_dir.exists():
+    if output_dir and output_dir.exists():
         imgs_added = 0
         for e in worst[:MAX_IMAGES_FOR_CONTEXT]:
             if imgs_added >= MAX_IMAGES_FOR_CONTEXT:
@@ -176,7 +176,7 @@ def rewrite_prompt(
             local_file = e.get("local_file")
             if not local_file:
                 continue
-            p = stage2_dir / local_file
+            p = output_dir / local_file
             if p.exists():
                 b64 = load_image_b64(p)
                 if b64:
@@ -201,6 +201,75 @@ def rewrite_prompt(
         return None
 
 
+def rewrite_weak_prompts(
+    entries: list[dict],
+    dimension_to_keys: dict,
+    output_dir: Path | None,
+    cycle: int,
+    score_threshold: float,
+    gemini_key: str,
+    stage_label: str,
+) -> bool:
+    """Compute avg scores, find weak dimensions, rewrite prompts. Returns True if any updated."""
+    score_keys = list(dimension_to_keys.keys())
+    scores = avg_scores(entries, score_keys)
+
+    print(f"\n  {stage_label} avg scores:")
+    for dim, val in scores.items():
+        flag = "  ← WEAK" if val < score_threshold else ""
+        print(f"    {dim:<30} {val:.1f}/10{flag}")
+
+    weak_dims = sorted(
+        [(d, v) for d, v in scores.items() if v < score_threshold],
+        key=lambda x: x[1],
+    )
+    if not weak_dims:
+        print(f"  All {stage_label} criteria ≥ {score_threshold} — nothing to rewrite.")
+        return False
+
+    cfg = load_config()
+    any_updated = False
+    already_rewritten: set[str] = set()
+
+    for dim, dim_score in weak_dims:
+        for pkey in dimension_to_keys.get(dim, []):
+            if pkey in already_rewritten:
+                continue
+            current = cfg.get(pkey, "")
+            if not current:
+                continue
+
+            print(f"\n  Rewriting '{pkey}'  (drives {dim} = {dim_score:.1f}/10)…")
+            bad = worst_entries(entries, dim, MAX_IMAGES_FOR_CONTEXT)
+            new_prompt = rewrite_prompt(
+                current_prompt=current,
+                key=pkey,
+                weak_dimension=dim,
+                avg_score=dim_score,
+                worst=bad,
+                output_dir=output_dir,
+                gemini_key=gemini_key,
+            )
+            if new_prompt and new_prompt != current:
+                cfg[pkey] = new_prompt
+                any_updated = True
+                already_rewritten.add(pkey)
+                print(f"  ✓ {pkey} rewritten ({len(new_prompt)} chars)")
+                (HISTORY_DIR / f"cycle{cycle:02d}_{pkey}.txt").write_text(
+                    f"=== BEFORE  ({dim}={dim_score:.1f}) ===\n{current}\n\n"
+                    f"=== AFTER ===\n{new_prompt}\n",
+                    encoding="utf-8",
+                )
+            else:
+                print(f"  [skip] no change for {pkey}")
+
+    if any_updated:
+        save_config(cfg)
+        print("  Server will use new prompts on the next job (no restart needed).")
+
+    return any_updated
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -216,8 +285,6 @@ def main() -> None:
     parser.add_argument("--models", default="gemini-staged-pro")
     parser.add_argument("--score-threshold", type=float, default=SCORE_THRESHOLD,
                         help=f"Rewrite prompts scoring below this value (default {SCORE_THRESHOLD})")
-    parser.add_argument("--stage1-summary", type=Path, default=None,
-                        help="Path to existing stage1_summary JSON (skips Stage 1 on first cycle)")
     args = parser.parse_args()
 
     gemini_key = os.getenv("GEMINI_API_KEY", "")
@@ -227,7 +294,7 @@ def main() -> None:
 
     HISTORY_DIR.mkdir(exist_ok=True)
     history: list[dict] = []
-    stage1_summary_path: Path | None = args.stage1_summary
+    opt_dir = Path("opt_runs") / args.folder.name
 
     print(f"\n{'═'*72}")
     print(f"  PROMPT OPTIMIZER  cycles={args.cycles}  repeat={args.repeat}  "
@@ -241,29 +308,42 @@ def main() -> None:
 
         backup_config(cycle)
 
-        # ── Stage 1 ───────────────────────────────────────────────────────────
-        if stage1_summary_path is None:
-            print(f"\n[Cycle {cycle}] Stage 1 — placing mass in scene…")
-            run_test_script([
-                "--folder", str(args.folder),
-                "--models", args.models,
-                "--result", "1",
-                "--server", args.server,
-            ])
-            opt_dir = Path("opt_runs") / args.folder.name
-            s1_dirs = sorted(opt_dir.glob("stage1_*"),
-                             key=lambda p: p.stat().st_mtime, reverse=True)
-            if not s1_dirs:
-                print("  ERROR: no stage1 directory found — aborting cycle")
-                continue
-            jsons = list(s1_dirs[0].glob("stage1_summary_*.json"))
-            if not jsons:
-                print("  ERROR: no stage1_summary JSON found — aborting cycle")
-                continue
-            stage1_summary_path = max(jsons, key=lambda p: p.stat().st_mtime)
-            print(f"  Stage-1 summary: {stage1_summary_path}")
+        # ── Stage 1: run + judge ───────────────────────────────────────────────
+        print(f"\n[Cycle {cycle}] Stage 1 — placing mass in scene + judging…")
+        run_test_script([
+            "--folder", str(args.folder),
+            "--models", args.models,
+            "--result", "1",
+            "--judge",
+            "--server", args.server,
+        ])
 
-        # ── Stage 2 + judge ───────────────────────────────────────────────────
+        s1_dirs = sorted(opt_dir.glob("stage1_*"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        if not s1_dirs:
+            print("  ERROR: no stage1 directory found — aborting cycle")
+            continue
+        jsons = list(s1_dirs[0].glob("stage1_summary_*.json"))
+        if not jsons:
+            print("  ERROR: no stage1_summary JSON found — aborting cycle")
+            continue
+        stage1_summary_path = max(jsons, key=lambda p: p.stat().st_mtime)
+        print(f"  Stage-1 summary: {stage1_summary_path}")
+
+        s1_entries = json.loads(stage1_summary_path.read_text())
+
+        # Rewrite Stage 1 prompt based on Stage 1 judge scores
+        rewrite_weak_prompts(
+            entries=s1_entries,
+            dimension_to_keys=STAGE1_DIMENSION_TO_KEYS,
+            output_dir=s1_dirs[0],
+            cycle=cycle,
+            score_threshold=args.score_threshold,
+            gemini_key=gemini_key,
+            stage_label="Stage 1",
+        )
+
+        # ── Stage 2: run + judge ───────────────────────────────────────────────
         print(f"\n[Cycle {cycle}] Stage 2 — materializing + judging…")
         run_test_script([
             "--folder", str(args.folder),
@@ -275,90 +355,51 @@ def main() -> None:
             "--server", args.server,
         ])
 
-        opt_dir = Path("opt_runs") / args.folder.name
         s2_dirs = sorted(opt_dir.glob("stage2_*"),
                          key=lambda p: p.stat().st_mtime, reverse=True)
         if not s2_dirs:
-            print("  ERROR: no stage2 directory found — skipping optimization")
+            print("  ERROR: no stage2 directory found — skipping Stage 2 optimization")
             continue
         jsons = list(s2_dirs[0].glob("stage2_summary_*.json"))
         if not jsons:
-            print("  ERROR: no stage2_summary JSON found — skipping optimization")
+            print("  ERROR: no stage2_summary JSON found — skipping Stage 2 optimization")
             continue
         s2_json = max(jsons, key=lambda p: p.stat().st_mtime)
-        entries = json.loads(s2_json.read_text())
-        scores = avg_scores(entries)
-        history.append({"cycle": cycle, "scores": scores})
+        s2_entries = json.loads(s2_json.read_text())
 
-        # ── Print scores ──────────────────────────────────────────────────────
-        print(f"\n  Cycle {cycle} avg scores:")
-        for dim, val in scores.items():
-            flag = "  ← WEAK" if val < args.score_threshold and dim != "overall" else ""
-            print(f"    {dim:<30} {val:.1f}/10{flag}")
-
-        # ── Find weak dimensions ──────────────────────────────────────────────
-        weak_dims = sorted(
-            [(d, v) for d, v in scores.items()
-             if v < args.score_threshold and d != "overall"],
-            key=lambda x: x[1]
+        # Rewrite Stage 2 prompts based on Stage 2 judge scores
+        rewrite_weak_prompts(
+            entries=s2_entries,
+            dimension_to_keys=STAGE2_DIMENSION_TO_KEYS,
+            output_dir=s2_dirs[0],
+            cycle=cycle,
+            score_threshold=args.score_threshold,
+            gemini_key=gemini_key,
+            stage_label="Stage 2",
         )
 
-        if not weak_dims:
-            print(f"\n  All criteria ≥ {args.score_threshold} — nothing to rewrite.")
-            continue
-
-        # ── Rewrite weak prompts ──────────────────────────────────────────────
-        cfg = load_config()
-        any_updated = False
-        already_rewritten: set[str] = set()
-
-        for dim, dim_score in weak_dims:
-            for pkey in DIMENSION_TO_KEYS.get(dim, []):
-                if pkey in already_rewritten:
-                    continue
-                current = cfg.get(pkey, "")
-                if not current:
-                    continue
-
-                print(f"\n  Rewriting '{pkey}'  (drives {dim} = {dim_score:.1f}/10)…")
-                bad = worst_entries(entries, dim, MAX_IMAGES_FOR_CONTEXT)
-                new_prompt = rewrite_prompt(
-                    current_prompt=current,
-                    key=pkey,
-                    weak_dimension=dim,
-                    avg_score=dim_score,
-                    worst=bad,
-                    stage2_dir=s2_dirs[0],
-                    gemini_key=gemini_key,
-                )
-                if new_prompt and new_prompt != current:
-                    cfg[pkey] = new_prompt
-                    any_updated = True
-                    already_rewritten.add(pkey)
-                    print(f"  ✓ {pkey} rewritten ({len(new_prompt)} chars)")
-                    # Save diff to history
-                    (HISTORY_DIR / f"cycle{cycle:02d}_{pkey}.txt").write_text(
-                        f"=== BEFORE  ({dim}={dim_score:.1f}) ===\n{current}\n\n"
-                        f"=== AFTER ===\n{new_prompt}\n",
-                        encoding="utf-8",
-                    )
-                else:
-                    print(f"  [skip] no change for {pkey}")
-
-        if any_updated:
-            save_config(cfg)
-            print("  Server will use new prompts on the next job (no restart needed).")
+        # Track scores for final summary
+        s1_scores = avg_scores(s1_entries, list(STAGE1_DIMENSION_TO_KEYS.keys()))
+        s2_scores = avg_scores(s2_entries, list(STAGE2_DIMENSION_TO_KEYS.keys()))
+        history.append({"cycle": cycle, "s1_scores": s1_scores, "s2_scores": s2_scores})
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print(f"\n{'═'*72}")
     print("  OPTIMIZATION COMPLETE")
     print(f"{'═'*72}")
     if history:
-        dims = ["geometry_accuracy", "style_match", "background_preservation", "overall"]
-        print(f"  {'Cycle':<8}" + "".join(f"{d[:10]:>12}" for d in dims))
+        s1_dims = list(STAGE1_DIMENSION_TO_KEYS.keys())
+        s2_dims = list(STAGE2_DIMENSION_TO_KEYS.keys())
+        all_dims = s1_dims + s2_dims
+        header = f"  {'Cycle':<8}" + "".join(f"{d[:14]:>15}" for d in all_dims)
+        print(header)
         for h in history:
-            s = h["scores"]
-            print(f"  {h['cycle']:<8}" + "".join(f"{s.get(d, 0):>12.1f}" for d in dims))
+            row = f"  {h['cycle']:<8}"
+            for d in s1_dims:
+                row += f"{h['s1_scores'].get(d, 0):>15.1f}"
+            for d in s2_dims:
+                row += f"{h['s2_scores'].get(d, 0):>15.1f}"
+            print(row)
 
     (HISTORY_DIR / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"

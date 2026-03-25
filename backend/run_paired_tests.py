@@ -347,6 +347,7 @@ def _run_stage1(args: "argparse.Namespace", server: str, client: "httpx.Client",
             for run_idx in range(1, repeat + 1):
                 entry: dict = {
                     "job_id": None, "pair": pair["name"], "model": model, "run": run_idx,
+                    "stage": "stage1",
                     "mass": pair["mass"].name, "render": pair["render"].name,
                     "_mass_path": pair["mass"], "_render_path": pair["render"],
                     "status": "error", "output_url": None, "geometry_contract": None,
@@ -376,6 +377,22 @@ def _run_stage1(args: "argparse.Namespace", server: str, client: "httpx.Client",
     print(f"\nDownloading placed-mass images → {out_dir}")
     _download_outputs(job_entries, out_dir, server, client,
                       {m: f"s1-{model_short_map.get(m, m)}" for m in models})
+
+    if args.judge:
+        done_count = sum(1 for e in job_entries if e["status"] == "done")
+        print(f"\nJudging {done_count} Stage-1 output(s)…")
+        for i, entry in enumerate(job_entries, 1):
+            if entry["status"] != "done":
+                continue
+            run_tag = f" r{entry['run']}" if repeat > 1 else ""
+            print(f"  [{i}/{done_count}] {entry['pair']} / {entry['model']}{run_tag}…", end=" ", flush=True)
+            scores = judge_entry(server, entry, client)
+            if scores:
+                entry["judge"] = scores
+                print(f"overall={scores.get('overall', '?')}")
+            else:
+                print("failed")
+        _print_judge_summary(job_entries)
 
     serialisable = [{k: v for k, v in e.items() if not k.startswith("_")} for e in job_entries]
     json_path = out_dir / f"stage1_summary_{run_id}.json"
