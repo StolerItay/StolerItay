@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ── Path helpers (works both in dev and when frozen by PyInstaller) ──────────
 
