@@ -1614,6 +1614,45 @@ async def run_inpaint(
         jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
 
 
+async def run_place_mass(mass_path: Path, render_path: Path, job_id: str) -> None:
+    """Background task for /api/place-mass — runs Stage 1 only."""
+    try:
+        jobs[job_id]["status"] = "processing"
+        placed_path, geometry_contract = await gemini_place_mass_in_scene(mass_path, render_path)
+        jobs[job_id].update({
+            "status": "done",
+            "output_url": f"/outputs/{placed_path.name}",
+            "geometry_contract": geometry_contract,
+        })
+    except Exception as e:
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
+    finally:
+        mass_path.unlink(missing_ok=True)
+        render_path.unlink(missing_ok=True)
+
+
+async def run_materialize_mass(
+    placed_mass_path: Path,
+    render_path: Path,
+    geometry_contract: str,
+    prompt: str,
+    analyzer_model: str,
+    job_id: str,
+) -> None:
+    """Background task for /api/materialize-mass — runs Stage 2 only."""
+    try:
+        jobs[job_id]["status"] = "processing"
+        out_path = await gemini_materialize_placed_mass(
+            placed_mass_path, render_path, geometry_contract, prompt, analyzer_model
+        )
+        jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+    except Exception as e:
+        jobs[job_id].update({"status": "error", "error": str(e) or repr(e)})
+    finally:
+        placed_mass_path.unlink(missing_ok=True)
+        render_path.unlink(missing_ok=True)
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/update-render")
@@ -1629,6 +1668,42 @@ async def update_render(
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "pending"}
     asyncio.create_task(run_controlnet_render(render_path, mass_path, prompt, model, job_id, replicate_api_token))
+    return {"jobId": job_id}
+
+
+@app.post("/api/place-mass")
+async def place_mass(
+    render: UploadFile = File(...),
+    mass: UploadFile = File(...),
+):
+    """Stage 1 only — place the mass model into the scene. Returns job whose output is
+    the placed white/grey mass composite. The job result also carries geometry_contract."""
+    render_path = save_upload(render)
+    mass_path = save_upload(mass)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "pending"}
+    asyncio.create_task(run_place_mass(mass_path, render_path, job_id))
+    return {"jobId": job_id}
+
+
+@app.post("/api/materialize-mass")
+async def materialize_mass(
+    placed_mass: UploadFile = File(...),
+    render: UploadFile = File(...),
+    geometry_contract: str = Form(""),
+    prompt: str = Form(""),
+    model: str = Form("gemini-staged-pro"),
+):
+    """Stage 2 only — materialize a placed white-mass composite into a photorealistic render.
+    placed_mass is the Stage-1 output (white/grey mass already in scene).
+    render is the original reference render (for style/materials).
+    geometry_contract is the JSON/text from Stage-1 (optional but recommended)."""
+    placed_path = save_upload(placed_mass)
+    render_path = save_upload(render)
+    analyzer = "gemini-2.5-pro" if model == "gemini-staged-pro" else "gemini-2.5-flash"
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "pending"}
+    asyncio.create_task(run_materialize_mass(placed_path, render_path, geometry_contract, prompt, analyzer, job_id))
     return {"jobId": job_id}
 
 
@@ -1701,6 +1776,7 @@ async def get_job(job_id: str):
         "status": job["status"],
         "output_url": job.get("output_url"),
         "error": job.get("error"),
+        "geometry_contract": job.get("geometry_contract"),
     }
 
 

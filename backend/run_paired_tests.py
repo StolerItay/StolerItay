@@ -110,6 +110,43 @@ def submit_job(server: str, tab: str, model: str, pair: dict, client: httpx.Clie
     return r.json()["jobId"]
 
 
+def submit_stage1_job(server: str, pair: dict, client: httpx.Client) -> str:
+    """Submit a Stage-1 place-mass job; returns job_id."""
+    mass_path: Path = pair["mass"]
+    render_path: Path = pair["render"]
+    with mass_path.open("rb") as mf, render_path.open("rb") as rf:
+        r = client.post(
+            f"{server}/api/place-mass",
+            files={
+                "mass":   (mass_path.name, mf, "image/png"),
+                "render": (render_path.name, rf, "image/jpeg"),
+            },
+            timeout=60,
+        )
+    r.raise_for_status()
+    return r.json()["jobId"]
+
+
+def submit_stage2_job(server: str, entry: dict, client: httpx.Client) -> str:
+    """Submit a Stage-2 materialize job using the placed_mass saved from Stage 1."""
+    placed_path: Path = entry["_placed_path"]
+    render_path: Path = entry["_render_path"]
+    geometry_contract: str = entry.get("geometry_contract") or ""
+    model: str = entry["model"]
+    with placed_path.open("rb") as pf, render_path.open("rb") as rf:
+        r = client.post(
+            f"{server}/api/materialize-mass",
+            files={
+                "placed_mass": (placed_path.name, pf, "image/png"),
+                "render":      (render_path.name, rf, "image/jpeg"),
+            },
+            data={"model": model, "geometry_contract": geometry_contract, "prompt": ""},
+            timeout=60,
+        )
+    r.raise_for_status()
+    return r.json()["jobId"]
+
+
 def poll_all(server: str, job_entries: list[dict], client: httpx.Client) -> None:
     """Poll /api/job/{id} for every entry until all are settled."""
     while True:
@@ -125,6 +162,9 @@ def poll_all(server: str, job_entries: list[dict], client: httpx.Client) -> None
                     data = r.json()
                     entry["status"] = data["status"]
                     entry["output_url"] = data.get("output_url")
+                    # Store geometry_contract returned by place-mass jobs
+                    if data.get("geometry_contract"):
+                        entry["geometry_contract"] = data["geometry_contract"]
                     entry["error_msg"] = data.get("error") or (
                         "job failed (no details from server)" if data["status"] == "error" else None
                     )
@@ -267,6 +307,166 @@ def _print_judge_summary(job_entries: list[dict]) -> None:
     print(f"{'─' * 72}")
 
 
+def _run_stage1(args: "argparse.Namespace", server: str, client: "httpx.Client", model_short_map: dict) -> None:
+    """Run Stage 1 only (place-mass) for all pairs and save placed images + geometry contracts."""
+    pairs = find_pairs(args.folder)
+    if not pairs:
+        print(f"ERROR: No valid pairs found in {args.folder}", file=sys.stderr)
+        sys.exit(1)
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()
+              if m.strip() in ("gemini-staged-pro", "gemini-staged-flash")]
+    if not models:
+        models = ["gemini-staged-pro"]
+
+    repeat = max(1, args.repeat)
+    total = len(pairs) * len(models) * repeat
+    print(f"\nStage 1 — placing mass in scene")
+    print(f"Submitting {total} job(s) ({len(pairs)} pairs × {len(models)} models × {repeat} repeat(s))")
+
+    job_entries: list[dict] = []
+    for pair in pairs:
+        for model in models:
+            for run_idx in range(1, repeat + 1):
+                entry: dict = {
+                    "job_id": None, "pair": pair["name"], "model": model, "run": run_idx,
+                    "mass": pair["mass"].name, "render": pair["render"].name,
+                    "_mass_path": pair["mass"], "_render_path": pair["render"],
+                    "status": "error", "output_url": None, "geometry_contract": None,
+                    "error_msg": None, "submit_error": None,
+                }
+                try:
+                    job_id = submit_stage1_job(server, pair, client)
+                    entry["job_id"] = job_id
+                    entry["status"] = "pending"
+                    run_tag = f" r{run_idx}" if repeat > 1 else ""
+                    print(f"  Submitted [{pair['name']:6s}] [{model:18s}]{run_tag} → {job_id[:8]}…")
+                except Exception as exc:
+                    entry["submit_error"] = str(exc)
+                    print(f"  FAILED    [{pair['name']:6s}] [{model:18s}]  {exc}")
+                job_entries.append(entry)
+
+    pending = [e for e in job_entries if e["job_id"]]
+    if pending:
+        print(f"\nWaiting for {len(pending)} Stage-1 job(s)…")
+        poll_all(server, pending, client)
+
+    print_summary(job_entries, server)
+
+    run_id = str(uuid.uuid4())[:8]
+    out_dir = Path("opt_runs") / args.folder.name / f"stage1_{run_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nDownloading placed-mass images → {out_dir}")
+    _download_outputs(job_entries, out_dir, server, client,
+                      {m: f"s1-{model_short_map.get(m, m)}" for m in models})
+
+    serialisable = [{k: v for k, v in e.items() if not k.startswith("_")} for e in job_entries]
+    json_path = out_dir / f"stage1_summary_{run_id}.json"
+    json_path.write_text(json.dumps(serialisable, indent=2, default=str))
+    print(f"Stage-1 results saved to: {json_path}")
+
+
+def _run_stage2(args: "argparse.Namespace", server: str, client: "httpx.Client", model_short_map: dict) -> None:
+    """Run Stage 2 only (materialize) using saved Stage-1 outputs."""
+    stage1_path: Path = args.stage1_summary
+    if not stage1_path or not stage1_path.exists():
+        print("ERROR: --stage1-summary must point to a stage1_summary_*.json file", file=sys.stderr)
+        sys.exit(1)
+
+    stage1_entries: list[dict] = json.loads(stage1_path.read_text())
+    done_s1 = [e for e in stage1_entries if e.get("status") == "done" and e.get("local_file")]
+    if not done_s1:
+        print("ERROR: No successful Stage-1 entries with local_file found in summary", file=sys.stderr)
+        sys.exit(1)
+
+    s1_dir = stage1_path.parent
+    models = [m.strip() for m in args.models.split(",") if m.strip()
+              if m.strip() in ("gemini-staged-pro", "gemini-staged-flash")]
+    if not models:
+        models = ["gemini-staged-pro"]
+
+    repeat = max(1, args.repeat)
+    print(f"\nStage 2 — materializing {len(done_s1)} placed-mass image(s) × {len(models)} model(s) × {repeat} repeat(s)")
+
+    # Rebuild render-path lookup from original folder
+    render_lookup: dict[str, Path] = {}
+    for pair_dir in sorted(args.folder.iterdir()):
+        if not pair_dir.is_dir():
+            continue
+        imgs = [p for p in pair_dir.iterdir() if p.suffix.lower() in ALLOWED_SUFFIXES]
+        render = next((p for p in imgs if "--render" in p.stem.lower()), None)
+        if render:
+            render_lookup[pair_dir.name] = render
+
+    job_entries: list[dict] = []
+    for s1 in done_s1:
+        placed_local = s1_dir / s1["local_file"]
+        if not placed_local.exists():
+            print(f"  [warn] Placed image not found: {placed_local}, skipping")
+            continue
+        pair_name = s1["pair"]
+        render_path = render_lookup.get(pair_name)
+        if not render_path:
+            print(f"  [warn] No render found for pair {pair_name}, skipping")
+            continue
+        geometry_contract = s1.get("geometry_contract") or ""
+
+        for model in models:
+            for run_idx in range(1, repeat + 1):
+                entry: dict = {
+                    "job_id": None, "pair": pair_name, "model": model, "run": run_idx,
+                    "placed_file": s1["local_file"], "render": render_path.name,
+                    "_placed_path": placed_local, "_render_path": render_path,
+                    "geometry_contract": geometry_contract,
+                    "status": "error", "output_url": None,
+                    "error_msg": None, "submit_error": None,
+                }
+                try:
+                    job_id = submit_stage2_job(server, entry, client)
+                    entry["job_id"] = job_id
+                    entry["status"] = "pending"
+                    run_tag = f" r{run_idx}" if repeat > 1 else ""
+                    print(f"  Submitted [{pair_name:6s}] [{model:18s}]{run_tag} → {job_id[:8]}…")
+                except Exception as exc:
+                    entry["submit_error"] = str(exc)
+                    print(f"  FAILED    [{pair_name:6s}] [{model:18s}]  {exc}")
+                job_entries.append(entry)
+
+    pending = [e for e in job_entries if e["job_id"]]
+    if pending:
+        print(f"\nWaiting for {len(pending)} Stage-2 job(s)…")
+        poll_all(server, pending, client)
+
+    print_summary(job_entries, server)
+
+    run_id = str(uuid.uuid4())[:8]
+    out_dir = stage1_path.parent.parent / f"stage2_{run_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nDownloading final renders → {out_dir}")
+    _download_outputs(job_entries, out_dir, server, client, model_short_map)
+
+    if args.judge:
+        done_count = sum(1 for e in job_entries if e["status"] == "done")
+        print(f"\nJudging {done_count} output(s)…")
+        for i, entry in enumerate(job_entries, 1):
+            if entry["status"] != "done":
+                continue
+            run_tag = f" r{entry['run']}" if repeat > 1 else ""
+            print(f"  [{i}/{done_count}] {entry['pair']} / {entry['model']}{run_tag}…", end=" ", flush=True)
+            scores = judge_entry(server, entry, client)
+            if scores:
+                entry["judge"] = scores
+                print(f"overall={scores.get('overall', '?')}")
+            else:
+                print("failed")
+        _print_judge_summary(job_entries)
+
+    serialisable = [{k: v for k, v in e.items() if not k.startswith("_")} for e in job_entries]
+    json_path = out_dir / f"stage2_summary_{run_id}.json"
+    json_path.write_text(json.dumps(serialisable, indent=2, default=str))
+    print(f"Stage-2 results saved to: {json_path}")
+
+
 def _run_retry(args: "argparse.Namespace", server: str, client: "httpx.Client", model_short_map: dict) -> None:
     """Re-submit all errored entries from an existing summary and merge results back."""
     summary_path: Path = args.retry_failed
@@ -390,6 +590,26 @@ def main() -> None:
         default=False,
         help="After all jobs finish, ask Gemini to score each output and print a leaderboard",
     )
+    parser.add_argument(
+        "--result",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        metavar="{1,2}",
+        help=(
+            "Run only one stage of the staged pipeline. "
+            "1 = Stage 1 only (place mass in scene, save placed images). "
+            "2 = Stage 2 only (materialize placed images — requires --stage1-summary). "
+            "Omit to run the full pipeline as normal."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-summary",
+        type=Path,
+        default=None,
+        metavar="STAGE1_JSON",
+        help="Path to stage1_summary_*.json produced by --result 1. Required for --result 2.",
+    )
     args = parser.parse_args()
 
     server = args.server.rstrip("/")
@@ -421,6 +641,14 @@ def main() -> None:
         # ── Retry-failed mode ─────────────────────────────────────────────────
         if args.retry_failed:
             _run_retry(args, server, client, MODEL_SHORT)
+            return
+
+        # ── Single-stage modes ────────────────────────────────────────────────
+        if args.result == 1:
+            _run_stage1(args, server, client, MODEL_SHORT)
+            return
+        if args.result == 2:
+            _run_stage2(args, server, client, MODEL_SHORT)
             return
 
         # ── Discover pairs ────────────────────────────────────────────────────
