@@ -113,6 +113,47 @@ def get_gemini_key() -> str:
     return os.getenv("GEMINI_API_KEY", "")
 
 
+# Maximum pixel dimension sent to Gemini. Images larger than this are resized
+# proportionally before base64-encoding. Larger images cause Gemini API timeouts.
+_GEMINI_MAX_PX = 1536
+
+
+def _resize_for_gemini(source: "Path | bytes", is_render: bool = False) -> tuple[bytes, str]:
+    """Return (image_bytes, mime_type) resized so the longest side ≤ _GEMINI_MAX_PX.
+
+    Renders (photos) are re-encoded as JPEG (quality=90) for smaller payloads.
+    Mass models (diagrams) are kept as PNG to preserve clean edges.
+    If the image is already within the limit it is returned as-is (original bytes).
+    """
+    raw = source if isinstance(source, bytes) else source.read_bytes()
+    try:
+        img = _PILImage.open(io.BytesIO(raw))
+        w, h = img.size
+        if max(w, h) > _GEMINI_MAX_PX:
+            ratio = _GEMINI_MAX_PX / max(w, h)
+            new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+            img = img.resize((new_w, new_h), _PILImage.LANCZOS)
+            print(f"  [resize] {w}×{h} → {new_w}×{new_h}", flush=True)
+        buf = io.BytesIO()
+        if is_render:
+            img.convert("RGB").save(buf, format="JPEG", quality=90)
+            return buf.getvalue(), "image/jpeg"
+        else:
+            img.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+    except Exception:
+        # Fall back to raw bytes if PIL fails
+        suffix = (source.suffix.lower() if isinstance(source, Path) else "")
+        mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+        return raw, mime
+
+
+def _b64_for_gemini(source: "Path | bytes", is_render: bool = False) -> tuple[str, str]:
+    """Convenience wrapper: resize → base64 encode → return (b64_str, mime_type)."""
+    img_bytes, mime = _resize_for_gemini(source, is_render=is_render)
+    return base64.b64encode(img_bytes).decode(), mime
+
+
 def _crop_mass_to_content(mass_path: Path) -> bytes:
     """Crop white/transparent padding from a mass model image so the geometry fills the frame.
 
@@ -208,15 +249,10 @@ async def gemini_generate_render(mass_path: Path, reference_path: Path, prompt: 
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
     # Use original mass (uncropped) for generation — the mass is already positioned at the exact
     # scale and location the building occupies in the render scene; cropping would destroy that.
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(reference_path, is_render=True)
 
     # For geometry extraction, crop to content so the text model can read details clearly,
     # but the original (uncropped) mass is what gets sent to the image generator.
@@ -305,13 +341,8 @@ async def gemini_25_analyze(mass_path: Path, reference_path: Path, extra_prompt:
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("analyzer_instruction", (
         "You are a senior architectural visualization director. "
@@ -413,18 +444,12 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
     # Erase the old building from the render so Gemini cannot copy it
     clean_render_bytes = _erase_building_from_render(mass_path, render_path)
 
     # Original mass is sent to the generator (preserves scale/position in the scene)
-    mass_b64, mass_mime = _b64(mass_path)
-    ref_b64 = base64.b64encode(clean_render_bytes).decode()
-    ref_mime = "image/png"
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(clean_render_bytes, is_render=True)
 
     # Crop for geometry extraction only (text model reads fine-detail better without white padding)
     cropped_for_extraction = _crop_mass_to_content(mass_path)
@@ -507,6 +532,140 @@ async def gemini_generate_render_update(mass_path: Path, render_path: Path, prom
     raise ValueError(f"Gemini returned no image. Response: {data}")
 
 
+async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> Path:
+    """Stage 1 of the staged pipeline.
+
+    Ask Gemini's image-gen model to take the mass/wireframe model and place it
+    cleanly into the background scene at the correct position, scale, and
+    perspective — outputting a clean massing diagram in the scene rather than
+    a fully rendered image.
+
+    The output is used as a better "mass" input for Stage 2, because the
+    geometry is already seated in the correct spatial context.
+    """
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+
+    mass_b64, mass_mime = _b64_for_gemini(mass_path, is_render=False)
+    ref_b64, ref_mime   = _b64_for_gemini(render_path, is_render=True)
+
+    # Extract geometry contract from the mass so the placement prompt can enforce exact proportions
+    cropped_for_extraction = _crop_mass_to_content(mass_path)
+    geometry_contract = await _extract_mass_geometry(mass_path, key, cropped_for_extraction)
+    geometry_section = ""
+    if geometry_contract:
+        geometry_section = (
+            "\n\nGEOMETRY CONTRACT — these proportions are ABSOLUTE CONSTRAINTS for the placed mass:\n"
+            f"{geometry_contract}\n"
+            "Every tower height ratio, silhouette feature, crown shape, and podium form listed above "
+            "MUST appear correctly in your output. Do NOT rescale, simplify, or omit any element.\n"
+        )
+
+    instruction = (
+        "You are an architectural visualization assistant. "
+        "Image 1 is a new building massing model — a wireframe/volume diagram that defines the EXACT geometry "
+        "(tower count, heights, silhouette, crown shapes, podium) of a new building. "
+        "Image 2 is a photorealistic aerial render of an urban scene with an existing building on site.\n\n"
+        "TASK: Produce a composite image that shows Image 2's background with Image 1's building mass "
+        "placed at EXACTLY the correct position, scale, and perspective in the scene — replacing the "
+        "existing building footprint.\n\n"
+        "PLACEMENT RULES (strictly enforced):\n"
+        "1. Keep EVERYTHING in Image 2 UNCHANGED except the building area — sky, roads, trees, surrounding "
+        "buildings, ground plane, and all infrastructure must remain pixel-perfect.\n"
+        "2. Place Image 1's mass as a clean white/light-grey volume silhouette at the site — "
+        "match the camera perspective and focal length of Image 2 exactly so the base sits on "
+        "the correct ground plane with proper foreshortening.\n"
+        "3. Preserve ALL geometry from Image 1: exact number of towers, relative heights, "
+        "crown shapes, podium form, connecting elements — do not simplify or alter any feature.\n"
+        "4. The building size in the output must be consistent with the scale of surrounding buildings "
+        "and infrastructure in Image 2.\n"
+        "5. Do NOT apply photorealistic materials, textures, windows, or facade details — "
+        "output a clean massing/volume diagram: flat white or light grey solid forms.\n"
+        "6. Do NOT add shadows or atmospheric effects to the mass — keep it as a neutral clean volume.\n"
+        + geometry_section +
+        "\nOutput: the scene from Image 2 with the clean mass from Image 1 placed on site. "
+        "No text, no annotations."
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": instruction},
+            {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
+            {"inline_data": {"mime_type": ref_mime,  "data": ref_b64}},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    _image_gen_models = [
+        "gemini-2.0-flash-exp",
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ]
+    data = None
+    _errors: list[str] = []
+    for _mid in _image_gen_models:
+        _url = f"https://generativelanguage.googleapis.com/v1beta/models/{_mid}:generateContent?key={key}"
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.post(_url, json=payload)
+            print(f"[Gemini place-mass stage-1] {_mid} → {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (404, 400, 403):
+                _errors.append(f"{_mid}: {r.status_code} {r.text[:120]}")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+
+    if data is None:
+        raise ValueError(f"Stage-1 placement: no Gemini image-gen model succeeded. Errors: {'; '.join(_errors)}")
+
+    for part in data["candidates"][0]["content"]["parts"]:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline:
+            img_bytes = base64.b64decode(inline["data"])
+            placed_path = UPLOADS_DIR / f"placed_{uuid.uuid4().hex}.png"
+            placed_path.write_bytes(img_bytes)
+            return placed_path
+
+    raise ValueError(f"Stage-1 placement: Gemini returned no image. Response: {data}")
+
+
+async def gemini_staged_update_render(
+    mass_path: Path,
+    render_path: Path,
+    prompt: str = "",
+    analyzer_model: str = "gemini-2.5-pro",
+) -> Path:
+    """Two-stage update-render pipeline.
+
+    Stage 1 — Placement: gemini_place_mass_in_scene
+        Positions the mass model cleanly in the scene at the correct perspective
+        and scale. Background is untouched; building is a clean volume diagram.
+
+    Stage 2 — Render: gemini_25_render (analyzer → image-gen)
+        Takes the placed mass as its geometry input and the original render
+        (with old building erased) as the style/scene reference. Because the
+        mass is already correctly seated in the scene, the generator only needs
+        to apply materials and lighting — not solve placement simultaneously.
+    """
+    print("[staged] Stage 1: placing mass in scene…", flush=True)
+    placed_mass_path = await gemini_place_mass_in_scene(mass_path, render_path)
+    try:
+        # Erase old building from render so stage-2 uses only scene context
+        clean_render_path = UPLOADS_DIR / f"clean_{uuid.uuid4().hex}.png"
+        clean_render_path.write_bytes(_erase_building_from_render(mass_path, render_path))
+        print("[staged] Stage 2: rendering placed mass…", flush=True)
+        try:
+            out_path = await gemini_25_render(
+                placed_mass_path, clean_render_path, prompt, analyzer_model=analyzer_model
+            )
+        finally:
+            clean_render_path.unlink(missing_ok=True)
+        return out_path
+    finally:
+        placed_mass_path.unlink(missing_ok=True)
+
+
 async def gemini_25_analyze_three_image(
     original_mass_path: Path,
     modified_mass_path: Path,
@@ -530,14 +689,9 @@ async def gemini_25_analyze_three_image(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    orig_b64, orig_mime = _b64(original_mass_path)
-    mod_b64, mod_mime = _b64(modified_mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    orig_b64, orig_mime = _b64_for_gemini(original_mass_path, is_render=False)
+    mod_b64,  mod_mime  = _b64_for_gemini(modified_mass_path, is_render=False)
+    ref_b64,  ref_mime  = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("analyzer_three_image_instruction", (
         "You are a senior architectural visualization director. "
@@ -603,14 +757,9 @@ async def gemini_generate_render_three_image(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    orig_b64, orig_mime = _b64(original_mass_path)
-    mod_b64, mod_mime = _b64(modified_mass_path)
-    ref_b64, ref_mime = _b64(reference_path)
+    orig_b64, orig_mime = _b64_for_gemini(original_mass_path, is_render=False)
+    mod_b64,  mod_mime  = _b64_for_gemini(modified_mass_path, is_render=False)
+    ref_b64,  ref_mime  = _b64_for_gemini(reference_path, is_render=True)
 
     instruction = _load_prompt("direct_render_three_image_instruction", (
         "You are an expert architectural visualization artist. "
@@ -720,12 +869,7 @@ async def gemini_new_angle(
     if not key:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
-    def _b64(p: Path) -> tuple[str, str]:
-        suffix = p.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
-        return base64.b64encode(p.read_bytes()).decode(), mime
-
-    render_b64, render_mime = _b64(render_path)
+    render_b64, render_mime = _b64_for_gemini(render_path, is_render=True)
 
     angle_part = angle_prompt.strip() if angle_prompt.strip() else "a compelling new viewpoint"
     style_part = (
@@ -1037,6 +1181,12 @@ async def run_controlnet_render(
         elif model == "gemini-direct":
             # gemini_generate_render_update does its own erasing internally
             out_path = await gemini_generate_render_update(mass_path, render_path, prompt)
+            jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
+            return
+        elif model in ("gemini-staged-pro", "gemini-staged-flash"):
+            # Two-stage pipeline: place mass in scene first, then render
+            analyzer = "gemini-2.5-pro" if model == "gemini-staged-pro" else "gemini-2.5-flash"
+            out_path = await gemini_staged_update_render(mass_path, render_path, prompt, analyzer_model=analyzer)
             jobs[job_id].update({"status": "done", "output_url": f"/outputs/{out_path.name}"})
             return
 
@@ -1384,6 +1534,91 @@ async def get_job(job_id: str):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "replicate_configured": bool(os.getenv("REPLICATE_API_TOKEN"))}
+
+
+@app.post("/api/judge")
+async def judge_output(
+    mass: UploadFile = File(...),
+    render: UploadFile = File(...),
+    output_url: str = Form(...),
+):
+    """Score a generated output against the mass model and reference render.
+
+    Returns JSON:
+      { "scores": {"geometry": 1-10, "style": 1-10, "background": 1-10, "overall": 1-10},
+        "reasoning": "<text>" }
+    """
+    key = get_gemini_key()
+    if not key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
+
+    mass_bytes   = await mass.read()
+    render_bytes = await render.read()
+
+    # Resolve output image from local filesystem (URL is /outputs/<filename>)
+    out_filename = output_url.lstrip("/").split("/")[-1]
+    out_path = OUTPUTS_DIR / out_filename
+    if not out_path.exists():
+        raise HTTPException(status_code=404, detail=f"Output file not found: {out_filename}")
+    output_bytes = out_path.read_bytes()
+
+    # Resize all three for the judge (text model — just needs to see detail, not huge)
+    mass_b64,   mass_mime   = _b64_for_gemini(mass_bytes,   is_render=False)
+    render_b64, render_mime = _b64_for_gemini(render_bytes, is_render=True)
+    output_b64, output_mime = _b64_for_gemini(output_bytes, is_render=True)
+
+    judge_prompt = (
+        "You are a senior architectural visualization quality judge. "
+        "You will evaluate an AI-generated architectural rendering against two reference images.\n\n"
+        "Image 1: the MASS MODEL — the exact geometric blueprint (towers, heights, silhouette, crown shapes, podium).\n"
+        "Image 2: the REFERENCE RENDER — the target photorealistic style, materials, lighting, and scene context.\n"
+        "Image 3: the AI OUTPUT — the image to evaluate.\n\n"
+        "Score Image 3 on these four criteria (1–10 each, where 10 is perfect):\n"
+        "1. geometry_accuracy: Does Image 3 faithfully reproduce Image 1's exact shape? "
+        "Check tower count, relative heights, silhouette, crown forms, podium.\n"
+        "2. style_match: Does Image 3 match Image 2's materials, lighting, atmosphere, and photorealism?\n"
+        "3. background_preservation: Is the surrounding scene in Image 3 unchanged from Image 2? "
+        "(sky, roads, trees, neighboring buildings, ground plane)\n"
+        "4. overall: Overall quality as a convincing architectural visualization.\n\n"
+        "Respond ONLY with valid JSON in this exact format, no other text:\n"
+        '{"geometry_accuracy": <1-10>, "style_match": <1-10>, '
+        '"background_preservation": <1-10>, "overall": <1-10>, '
+        '"reasoning": "<one concise sentence per criterion, separated by |>"}'
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": judge_prompt},
+            {"inline_data": {"mime_type": mass_mime,    "data": mass_b64}},
+            {"inline_data": {"mime_type": render_mime,  "data": render_b64}},
+            {"inline_data": {"mime_type": output_mime,  "data": output_b64}},
+        ]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    judge_model = "gemini-2.5-flash"
+    judge_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{judge_model}:generateContent?key={key}"
+    )
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(judge_url, json=payload)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Gemini judge error {r.status_code}: {r.text[:300]}")
+
+    try:
+        raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        scores = json.loads(raw_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not parse judge response: {exc}")
+
+    return scores
+
+
+
 
 
 @app.post("/api/validate-token")
