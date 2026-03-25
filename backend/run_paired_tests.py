@@ -43,6 +43,7 @@ Output
 
 import argparse
 import json
+import statistics
 import sys
 import time
 import uuid
@@ -203,6 +204,69 @@ def _download_outputs(
             print(f"  WARN: could not download {img_name}: {exc}")
 
 
+def judge_entry(server: str, entry: dict, client: "httpx.Client") -> dict | None:
+    """Call /api/judge for a completed entry. Returns scores dict or None on failure."""
+    if entry["status"] != "done" or not entry.get("output_url"):
+        return None
+    mass_path: Path = entry["_mass_path"]
+    render_path: Path = entry["_render_path"]
+    output_url: str = entry["output_url"]
+    try:
+        with mass_path.open("rb") as mf, render_path.open("rb") as rf:
+            r = client.post(
+                f"{server}/api/judge",
+                files={
+                    "mass":   (mass_path.name, mf, "image/png"),
+                    "render": (render_path.name, rf, "image/jpeg"),
+                },
+                data={"output_url": output_url},
+                timeout=90,
+            )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        print(f"  [judge warn] {entry['pair']} / {entry['model']}: {exc}")
+        return None
+
+
+def _print_judge_summary(job_entries: list[dict]) -> None:
+    """Print a ranked leaderboard of judge scores grouped by model."""
+    judged = [e for e in job_entries if e.get("judge")]
+    if not judged:
+        return
+
+    # Group by model
+    from collections import defaultdict
+    by_model: dict[str, list[dict]] = defaultdict(list)
+    for e in judged:
+        by_model[e["model"]].append(e["judge"])
+
+    score_keys = ["geometry_accuracy", "style_match", "background_preservation", "overall"]
+
+    print(f"\n{'─' * 72}")
+    print("JUDGE SCORES (avg per model)")
+    print(f"{'─' * 72}")
+    print(f"  {'Model':<22} {'Geometry':>9} {'Style':>7} {'BG':>5} {'Overall':>9}")
+    print(f"  {'─'*22} {'─'*9} {'─'*7} {'─'*5} {'─'*9}")
+
+    rows = []
+    for model, score_list in by_model.items():
+        avgs = {k: statistics.mean(s[k] for s in score_list if k in s) for k in score_keys}
+        rows.append((model, avgs))
+
+    # Sort by overall descending
+    rows.sort(key=lambda x: x[1].get("overall", 0), reverse=True)
+    for model, avgs in rows:
+        print(
+            f"  {model:<22} "
+            f"{avgs.get('geometry_accuracy', 0):>9.1f} "
+            f"{avgs.get('style_match', 0):>7.1f} "
+            f"{avgs.get('background_preservation', 0):>5.1f} "
+            f"{avgs.get('overall', 0):>9.1f}"
+        )
+    print(f"{'─' * 72}")
+
+
 def _run_retry(args: "argparse.Namespace", server: str, client: "httpx.Client", model_short_map: dict) -> None:
     """Re-submit all errored entries from an existing summary and merge results back."""
     summary_path: Path = args.retry_failed
@@ -313,6 +377,19 @@ def main() -> None:
         metavar="SUMMARY_JSON",
         help="Re-submit all errored jobs from an existing summary JSON and merge results back",
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run each job N times (default 1). Useful for variance analysis.",
+    )
+    parser.add_argument(
+        "--judge",
+        action="store_true",
+        default=False,
+        help="After all jobs finish, ask Gemini to score each output and print a leaderboard",
+    )
     args = parser.parse_args()
 
     server = args.server.rstrip("/")
@@ -354,11 +431,13 @@ def main() -> None:
             )
             sys.exit(1)
 
+        repeat = max(1, args.repeat)
         print(f"\nFound {len(pairs)} pair(s): {[p['name'] for p in pairs]}")
-        total_jobs = len(pairs) * len(tabs) * len(models)
+        total_jobs = len(pairs) * len(tabs) * len(models) * repeat
+        repeat_note = f" × {repeat} repeat(s)" if repeat > 1 else ""
         print(
             f"Submitting {total_jobs} job(s)  "
-            f"({len(pairs)} pair(s) × {len(tabs)} tab(s) × {len(models)} model(s))"
+            f"({len(pairs)} pair(s) × {len(tabs)} tab(s) × {len(models)} model(s){repeat_note})"
         )
 
         # ── Submit all jobs ───────────────────────────────────────────────────
@@ -366,33 +445,39 @@ def main() -> None:
         for pair in pairs:
             for tab in tabs:
                 for model in models:
-                    entry: dict = {
-                        "job_id": None,
-                        "pair": pair["name"],
-                        "tab": tab,
-                        "model": model,
-                        "mass": pair["mass"].name,
-                        "render": pair["render"].name,
-                        "status": "error",
-                        "output_url": None,
-                        "error_msg": None,
-                        "submit_error": None,
-                    }
-                    try:
-                        job_id = submit_job(server, tab, model, pair, client)
-                        entry["job_id"] = job_id
-                        entry["status"] = "pending"
-                        print(
-                            f"  Submitted [{pair['name']:6s}] "
-                            f"[{tab:16s}] [{model:16s}] → {job_id[:8]}…"
-                        )
-                    except Exception as exc:
-                        entry["submit_error"] = str(exc)
-                        print(
-                            f"  FAILED    [{pair['name']:6s}] "
-                            f"[{tab:16s}] [{model:16s}]  {exc}"
-                        )
-                    job_entries.append(entry)
+                    for run_idx in range(1, repeat + 1):
+                        run_label = f"run{run_idx}" if repeat > 1 else ""
+                        entry: dict = {
+                            "job_id": None,
+                            "pair": pair["name"],
+                            "tab": tab,
+                            "model": model,
+                            "run": run_idx,
+                            "mass": pair["mass"].name,
+                            "render": pair["render"].name,
+                            "_mass_path": pair["mass"],    # used by judge, not serialised
+                            "_render_path": pair["render"],
+                            "status": "error",
+                            "output_url": None,
+                            "error_msg": None,
+                            "submit_error": None,
+                        }
+                        try:
+                            job_id = submit_job(server, tab, model, pair, client)
+                            entry["job_id"] = job_id
+                            entry["status"] = "pending"
+                            run_tag = f" r{run_idx}" if repeat > 1 else ""
+                            print(
+                                f"  Submitted [{pair['name']:6s}] "
+                                f"[{tab:16s}] [{model:16s}]{run_tag} → {job_id[:8]}…"
+                            )
+                        except Exception as exc:
+                            entry["submit_error"] = str(exc)
+                            print(
+                                f"  FAILED    [{pair['name']:6s}] "
+                                f"[{tab:16s}] [{model:16s}]  {exc}"
+                            )
+                        job_entries.append(entry)
 
         # ── Poll ──────────────────────────────────────────────────────────────
         pending_entries = [e for e in job_entries if e["job_id"]]
@@ -420,8 +505,34 @@ def main() -> None:
         print("\nDownloading output images…")
         _download_outputs(job_entries, out_dir, server, client, MODEL_SHORT)
 
+        # ── Judge (optional) ──────────────────────────────────────────────────
+        if args.judge:
+            done_count = sum(1 for e in job_entries if e["status"] == "done")
+            print(f"\nJudging {done_count} successful output(s) with Gemini…")
+            for i, entry in enumerate(job_entries, 1):
+                if entry["status"] != "done":
+                    continue
+                run_tag = f" r{entry['run']}" if repeat > 1 else ""
+                print(
+                    f"  [{i}/{done_count}] {entry['pair']} / {entry['model']}{run_tag}…",
+                    end=" ", flush=True,
+                )
+                scores = judge_entry(server, entry, client)
+                if scores:
+                    entry["judge"] = scores
+                    print(f"overall={scores.get('overall', '?')}")
+                else:
+                    print("failed")
+            _print_judge_summary(job_entries)
+
+        # ── Strip internal keys before saving ─────────────────────────────────
+        serialisable = [
+            {k: v for k, v in e.items() if not k.startswith("_")}
+            for e in job_entries
+        ]
+
         # ── Save JSON ─────────────────────────────────────────────────────────
-        json_path.write_text(json.dumps(job_entries, indent=2, default=str))
+        json_path.write_text(json.dumps(serialisable, indent=2, default=str))
         print(f"\nFull results saved to: {json_path}")
 
 

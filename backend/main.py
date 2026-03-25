@@ -1536,6 +1536,91 @@ async def health():
     return {"status": "ok", "replicate_configured": bool(os.getenv("REPLICATE_API_TOKEN"))}
 
 
+@app.post("/api/judge")
+async def judge_output(
+    mass: UploadFile = File(...),
+    render: UploadFile = File(...),
+    output_url: str = Form(...),
+):
+    """Score a generated output against the mass model and reference render.
+
+    Returns JSON:
+      { "scores": {"geometry": 1-10, "style": 1-10, "background": 1-10, "overall": 1-10},
+        "reasoning": "<text>" }
+    """
+    key = get_gemini_key()
+    if not key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
+
+    mass_bytes   = await mass.read()
+    render_bytes = await render.read()
+
+    # Resolve output image from local filesystem (URL is /outputs/<filename>)
+    out_filename = output_url.lstrip("/").split("/")[-1]
+    out_path = OUTPUTS_DIR / out_filename
+    if not out_path.exists():
+        raise HTTPException(status_code=404, detail=f"Output file not found: {out_filename}")
+    output_bytes = out_path.read_bytes()
+
+    # Resize all three for the judge (text model — just needs to see detail, not huge)
+    mass_b64,   mass_mime   = _b64_for_gemini(mass_bytes,   is_render=False)
+    render_b64, render_mime = _b64_for_gemini(render_bytes, is_render=True)
+    output_b64, output_mime = _b64_for_gemini(output_bytes, is_render=True)
+
+    judge_prompt = (
+        "You are a senior architectural visualization quality judge. "
+        "You will evaluate an AI-generated architectural rendering against two reference images.\n\n"
+        "Image 1: the MASS MODEL — the exact geometric blueprint (towers, heights, silhouette, crown shapes, podium).\n"
+        "Image 2: the REFERENCE RENDER — the target photorealistic style, materials, lighting, and scene context.\n"
+        "Image 3: the AI OUTPUT — the image to evaluate.\n\n"
+        "Score Image 3 on these four criteria (1–10 each, where 10 is perfect):\n"
+        "1. geometry_accuracy: Does Image 3 faithfully reproduce Image 1's exact shape? "
+        "Check tower count, relative heights, silhouette, crown forms, podium.\n"
+        "2. style_match: Does Image 3 match Image 2's materials, lighting, atmosphere, and photorealism?\n"
+        "3. background_preservation: Is the surrounding scene in Image 3 unchanged from Image 2? "
+        "(sky, roads, trees, neighboring buildings, ground plane)\n"
+        "4. overall: Overall quality as a convincing architectural visualization.\n\n"
+        "Respond ONLY with valid JSON in this exact format, no other text:\n"
+        '{"geometry_accuracy": <1-10>, "style_match": <1-10>, '
+        '"background_preservation": <1-10>, "overall": <1-10>, '
+        '"reasoning": "<one concise sentence per criterion, separated by |>"}'
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": judge_prompt},
+            {"inline_data": {"mime_type": mass_mime,    "data": mass_b64}},
+            {"inline_data": {"mime_type": render_mime,  "data": render_b64}},
+            {"inline_data": {"mime_type": output_mime,  "data": output_b64}},
+        ]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    judge_model = "gemini-2.5-flash"
+    judge_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{judge_model}:generateContent?key={key}"
+    )
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(judge_url, json=payload)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Gemini judge error {r.status_code}: {r.text[:300]}")
+
+    try:
+        raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        scores = json.loads(raw_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not parse judge response: {exc}")
+
+    return scores
+
+
+
+
+
 @app.post("/api/validate-token")
 async def validate_token(token: str = Form(...)):
     try:
