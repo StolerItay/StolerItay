@@ -561,8 +561,8 @@ async def gemini_materialize_placed_mass(
     )
 
     payload = {
+        "system_instruction": {"parts": [{"text": base_instruction}]},
         "contents": [{"parts": [
-            {"text": base_instruction},
             {"inline_data": {"mime_type": placed_mime, "data": placed_b64}},
             {"inline_data": {"mime_type": style_mime,  "data": style_b64}},
         ]}],
@@ -821,8 +821,8 @@ async def gemini_place_mass_in_scene(mass_path: Path, render_path: Path) -> tupl
     )
 
     payload = {
+        "system_instruction": {"parts": [{"text": instruction}]},
         "contents": [{"parts": [
-            {"text": instruction},
             {"inline_data": {"mime_type": mass_mime, "data": mass_b64}},
             {"inline_data": {"mime_type": ref_mime,  "data": ref_b64}},
         ]}],
